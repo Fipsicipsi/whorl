@@ -1,0 +1,9 @@
+// A three-lock ordering cycle across three functions: A < B < C < A.
+// No single global order can satisfy all three constraints at once.
+lock la : A
+lock lb : B
+lock lc : C
+
+fn lock_b_after_a() { with la { with lb { } } }   // A < B
+fn lock_c_after_b() { with lb { with lc { } } }   // B < C
+fn lock_a_after_c() { with lc { with la { } } }   // C < A

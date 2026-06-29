@@ -1,0 +1,23 @@
+// The FFI boundary. `vendor_flush` is a foreign function whose body Whorl
+// cannot see -- but its lock contract is DECLARED: it acquires Cache then Db.
+// Whorl folds that contract into the whole-program check, so an inconsistency
+// between foreign and local code is still caught. Here write() takes Db then
+// Cache while the vendor takes Cache then Db -> a real cross-boundary deadlock.
+//
+// (An `extern fn name` with no `acquires` clause is an explicit promise that the
+// foreign function takes no locks -- a visible, audited escape hatch, never a
+// silent assumption.)
+lock db    : Db
+lock cache : Cache
+
+extern fn vendor_flush acquires Cache, Db
+
+fn write() {
+    with db {
+        with cache { }       // Db < Cache
+    }
+}
+
+fn sync() {
+    vendor_flush()           // Cache < Db (from the contract) -> cycle
+}

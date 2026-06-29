@@ -1,0 +1,23 @@
+// The SAME generic helper as callback_deadlock.whorl, used consistently: every
+// path acquires Table before Row. Whorl resolves the callback targets and
+// proves the whole program deadlock-free -- with zero annotations on `helper`.
+lock table : Table
+lock row   : Row
+
+fn with_table_locked(body) {
+    with table {
+        body()
+    }
+}
+
+fn lock_a_row() {
+    with row { }
+}
+
+fn import() {
+    with_table_locked(lock_a_row)
+}
+
+fn audit() {
+    with_table_locked(lock_a_row)
+}

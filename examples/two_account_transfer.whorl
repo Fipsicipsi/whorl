@@ -1,0 +1,13 @@
+// The classic two-account transfer deadlock.
+// alice and bob are different lock instances of the SAME class, Account.
+// Acquiring bob while holding alice means "acquire an Account while holding an
+// Account" -> a self-cycle in the class-ordering graph. Two threads picking
+// different accounts in different orders can deadlock.
+lock alice : Account
+lock bob   : Account
+
+fn transfer() {
+    with alice {
+        with bob { }
+    }
+}

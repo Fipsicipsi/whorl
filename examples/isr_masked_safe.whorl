@@ -1,0 +1,15 @@
+// The fix for the interrupt-preemption deadlock: the task masks interrupts
+// while holding the ISR-shared lock, so the handler cannot preempt mid-hold.
+// Whorl drops the `Buf < CPU` edge inside `mask { }`, leaving only the ISR's
+// `CPU < Buf` — acyclic, provably safe.
+lock shared : Buf
+
+isr fn on_rx() {
+    with shared { }
+}
+
+fn task() {
+    mask {
+        with shared { }
+    }
+}

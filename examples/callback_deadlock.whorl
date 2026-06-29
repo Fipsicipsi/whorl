@@ -1,0 +1,33 @@
+// A deadlock that flows THROUGH a callback -- only visible with higher-order
+// held-set propagation (P2). `with_table_locked` is a generic helper that holds
+// the Table lock and runs whatever callback you pass it. P1 could not even
+// express `body()`.
+//
+//   import():  hold Table (via helper), callback locks Row   => Table < Row
+//   refresh(): hold Row, then Table (via helper)             => Row < Table
+//
+// Neither the helper nor either caller looks wrong alone; together they cycle.
+lock table : Table
+lock row   : Row
+
+fn with_table_locked(body) {
+    with table {
+        body()
+    }
+}
+
+fn lock_a_row() {
+    with row { }
+}
+
+fn noop() { }
+
+fn import() {
+    with_table_locked(lock_a_row)
+}
+
+fn refresh() {
+    with row {
+        with_table_locked(noop)
+    }
+}

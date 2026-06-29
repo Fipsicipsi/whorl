@@ -1,0 +1,9 @@
+// The fix: acquire both same-class locks together, in a defined order.
+// `ordered(alice, bob)` imposes a total order over the set (e.g. by id), which
+// can never form a cycle -- so Whorl proves it deadlock-free.
+lock alice : Account
+lock bob   : Account
+
+fn transfer() {
+    with ordered(alice, bob) { }
+}

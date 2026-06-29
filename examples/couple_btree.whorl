@@ -1,0 +1,18 @@
+// Hand-over-hand (lock-coupling) B-tree descent. Each step holds the current
+// node and acquires the child -- all of class BTreeNode. Without `couple` this
+// is the classic same-class nesting Whorl flags as a deadlock; `couple` asserts
+// the traversal is monotonic (root -> leaf), so Whorl trusts the hand-over-hand
+// chain and proves it deadlock-free -- while still checking everything else.
+lock root  : BTreeNode
+lock child : BTreeNode
+lock leaf  : BTreeNode
+
+fn descend() {
+    couple BTreeNode {
+        with root {
+            with child {
+                with leaf { }
+            }
+        }
+    }
+}

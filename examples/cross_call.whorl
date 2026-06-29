@@ -1,0 +1,26 @@
+// A deadlock that is invisible in any single function -- it only appears once
+// you follow a call. This is what P1's held-set propagation buys over P0.
+//
+//   aggregate(): holds RiskBook, then acquires Account   => RiskBook < Account
+//   rebalance(): holds Account, then CALLS take_risk(),
+//                which acquires RiskBook                  => Account < RiskBook
+//
+// Neither function alone looks wrong; together they form a cycle.
+lock acct : Account
+lock risk : RiskBook
+
+fn take_risk() {
+    with risk { }
+}
+
+fn aggregate() {
+    with risk {
+        with acct { }
+    }
+}
+
+fn rebalance() {
+    with acct {
+        take_risk()
+    }
+}

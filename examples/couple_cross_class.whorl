@@ -1,0 +1,20 @@
+// `couple` makes same-class hand-over-hand safe, but it does NOT hide a genuine
+// inversion against a DIFFERENT lock class. Here the traversal also touches a
+// Catalog lock, and reindex() takes the two classes in the opposite order --
+// still a real deadlock, correctly reported.
+lock node    : BTreeNode
+lock catalog : Catalog
+
+fn descend() {
+    couple BTreeNode {
+        with node {
+            with catalog { }     // BTreeNode < Catalog
+        }
+    }
+}
+
+fn reindex() {
+    with catalog {
+        with node { }            // Catalog < BTreeNode  -> cycle
+    }
+}

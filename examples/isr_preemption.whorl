@@ -1,0 +1,17 @@
+// An interrupt-preemption deadlock (single-core, embedded). The RX interrupt
+// handler and a task both lock `shared`, but the task does NOT mask interrupts
+// while holding it. The ISR can fire mid-hold, block on `shared` (held by the
+// preempted task), and the task can never run to release it.
+//
+// Whorl models the ISR as holding the CPU (=> CPU < Buf) and the unmasked task
+// as depending on the CPU while holding Buf (=> Buf < CPU). The two close a
+// cycle. The fix is `mask { ... }` (see isr_masked_safe.whorl).
+lock shared : Buf
+
+isr fn on_rx() {
+    with shared { }
+}
+
+fn task() {
+    with shared { }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "whorl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A sound, inferred static analysis for lock-ordering and interrupt-preemption deadlock freedom (zero dependencies)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["deadlock", "static-analysis", "concurrency", "lock-ordering"]
+categories = ["development-tools", "concurrency"]
+repository = "https://github.com/fipsicipsi/whorl"
+
+[[bin]]
+name = "whorl"
+path = "src/main.rs"
+
+# Whorl has NO dependencies on purpose: the graph, fixpoints, parser, and solver
+# ARE the project, so they are hand-written in pure std. It builds anywhere,
+# offline, with no supply chain.
+
+[profile.release]
+lto = true

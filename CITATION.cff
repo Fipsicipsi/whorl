@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "Whorl: a sound, inferred static analysis for lock-ordering deadlock freedom"
+message: "If you use Whorl in academic work, please cite it."
+type: software
+authors:
+  - given-names: felix
+    alias: fipsicipsi
+    website: "https://github.com/fipsicipsi"
+abstract: >-
+  Whorl is a zero-dependency static analyzer that proves freedom from two
+  classes of deadlock - lock-ordering (circular-wait) and single-core
+  interrupt-preemption - by reducing both to a wait-for cycle over inferred
+  lock classes (Havender's theorem). It infers the lock order (no annotations
+  in the common case), reports a witnessed cycle on failure, and scales
+  polynomially via 0-CFA callback resolution and a may-be-held summary fixpoint.
+keywords:
+  - static analysis
+  - deadlock
+  - lock ordering
+  - concurrency
+  - Havender
+license: "MIT OR Apache-2.0"

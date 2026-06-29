@@ -1,0 +1,20 @@
+// A consistent lock hierarchy: BankLock < Account < AuditLog.
+// Every function acquires locks in the same order, so the graph is acyclic and
+// Whorl proves no lock-ordering deadlock is possible.
+lock bank  : BankLock
+lock acct  : Account
+lock audit : AuditLog
+
+fn open_account() {
+    with bank {
+        with acct { }
+    }
+}
+
+fn post() {
+    with bank {
+        with acct {
+            with audit { }
+        }
+    }
+}
