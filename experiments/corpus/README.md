@@ -95,6 +95,9 @@ match arm; `Input::source_name()` is gone (match `Input::File`/`Input::Str`);
 
 ## Caveats
 
-This corpus is tiny and intra-procedural (the analyzer's current limit). Growing
-it -- adversarial cases, real-crate snippets, interprocedural held-sets once
-`whorl_lint` supports them -- is the actual, unglamorous work behind the moat.
+This corpus is tiny. Thirteen labeled cases beat zero, and the head-to-head
+result is real, but it cannot carry a general soundness claim. Growing it --
+the published Lockbud/Archerfish real-world bugs, real driver/HAL-shaped SAFE
+code, locks behind closures and trait objects (the known remaining blind spot
+of both Whorl implementations) -- is the actual, unglamorous work behind the
+moat.
