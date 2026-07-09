@@ -43,6 +43,16 @@ A second predicted false positive (guard released via `std::mem::drop`) was
 fixed by sound move-tracking: a `_a = move _b` statement transfers guard
 ownership, so the held-set follows the value, and `mem::drop` kills it.
 
+## The dylint column (`run_dylint.py`)
+
+`run_dylint.py` runs the REAL pipeline (cargo dylint -> events JSON ->
+`whorl --events`) on every case and cross-checks it against both the ground
+truth and the stable-MIR PoC. Two independent implementations of the same
+analysis on the same corpus is a differential test in itself: any disagreement
+is a bug in one of them. Current status: 11/12 match ground truth, 0 false
+negatives, 0 divergences between the two implementations; the single miss is
+the same deliberate Havender false positive in both.
+
 ## The `lockbud` column (Direction 2: earn the claim)
 
 The runner prints a `lockbud` column held at `TBD`. Filling it is the head-to-head
