@@ -1,8 +1,16 @@
-# whorl_lint -- Whorl MIR front-end (WIP scaffold)
+# whorl_lint -- Whorl MIR front-end
 
-**Status: work-in-progress scaffold. This is NOT part of the stable `whorl`
-crate or its CI workspace.** It is a separate cargo workspace that builds ONLY
-on a pinned Rust **nightly** with the `rustc-dev` component and `cargo-dylint`.
+**Status: builds and runs end-to-end on the pinned nightly.** Verified on a
+real crate: the classic two-account transfer produces the correct events
+(second acquire with the first guard's class in the held-set), the stable
+solver reports the deadlock with a witness pointing at the real source line,
+and a consistently-ordered crate gets a `[SAFE]` verdict with a valid global
+lock order. It remains an experiment: intra-procedural, a small lock-API
+matcher, and a young test surface -- see limits below.
+
+**This is NOT part of the stable `whorl` crate or its CI workspace.** It is a
+separate cargo workspace that builds ONLY on a pinned Rust **nightly** with the
+`rustc-dev` component and `cargo-dylint`.
 The stable `whorl` crate is deliberately zero-dependency and builds on stable
 Rust; this crate uses `#![feature(rustc_private)]` and the unstable compiler
 internals, so it is intentionally kept out of the stable build and CI.

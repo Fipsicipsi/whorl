@@ -7,6 +7,7 @@
 //! CI gate.
 
 mod ast;
+mod events;
 mod frontend;
 mod model;
 mod parser;
@@ -22,11 +23,18 @@ fn main() -> ExitCode {
     if dot_mode {
         args.remove(0);
     }
+    let events_mode = matches!(args.first().map(String::as_str), Some("--events"));
+    if events_mode {
+        args.remove(0);
+    }
 
     if args.is_empty() {
         eprintln!("whorl - compile-time freedom from lock-ordering deadlocks\n");
         eprintln!("usage: whorl [--dot] <program.whorl> [more.whorl ...]");
-        eprintln!("  --dot   emit the lock-order graph as Graphviz DOT (cycle edges in red)");
+        eprintln!("       whorl --events <events.json> [more.json ...]");
+        eprintln!("  --dot      emit the lock-order graph as Graphviz DOT (cycle edges in red)");
+        eprintln!("  --events   analyze pre-lowered events (e.g. from the MIR front-end,");
+        eprintln!("             experiments/whorl_lint) instead of .whorl source");
         eprintln!("\nsee the examples/ directory for the language.");
         return ExitCode::from(2);
     }
@@ -46,7 +54,12 @@ fn main() -> ExitCode {
 
     let mut any_deadlock = false;
     for path in &args {
-        match run_one(path) {
+        let result = if events_mode {
+            run_events(path)
+        } else {
+            run_one(path)
+        };
+        match result {
             Ok(true) => any_deadlock = true,
             Ok(false) => {}
             Err(e) => {
@@ -80,6 +93,19 @@ fn run_one(path: &str) -> Result<bool, String> {
     let report = analyze(&prog);
     // A deadlock found in a partial analysis is still real and sound. Only the
     // *absence* of a deadlock is inconclusive when the analysis was truncated.
+    let deadlock = matches!(report.outcome, Outcome::Deadlock { .. });
+    let bad = deadlock || prog.incomplete.is_some();
+    print_report(&report, prog.incomplete.as_deref());
+    Ok(bad)
+}
+
+/// Like [`run_one`], but the events were already lowered by an external
+/// front-end (the MIR lint) and arrive as JSON.
+fn run_events(path: &str) -> Result<bool, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut prog = events::parse(&src)?;
+    prog.name = basename(path);
+    let report = analyze(&prog);
     let deadlock = matches!(report.outcome, Outcome::Deadlock { .. });
     let bad = deadlock || prog.incomplete.is_some();
     print_report(&report, prog.incomplete.as_deref());

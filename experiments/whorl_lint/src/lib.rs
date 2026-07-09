@@ -143,13 +143,47 @@ fn guard_class_of_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<(&'sta
     Some((kind, data))
 }
 
+/// Remove `::<...>` generic segments (balanced) from a def path, so
+/// `std::sync::Mutex::<T>::lock` compares as `std::sync::Mutex::lock`.
+/// def_path_str on this nightly renders impl-self generics INSIDE the path
+/// (confirmed via WHORL_DEBUG), so suffix matching must strip them first.
+fn strip_generics(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b':' && b.get(i + 1) == Some(&b':') && b.get(i + 2) == Some(&b'<') {
+            let mut depth = 0usize;
+            i += 2; // at '<'
+            while i < b.len() {
+                match b[i] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1; // past '>'
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// True if `did` is a lock-acquiring method. PRODUCTION form should use
 /// clippy_utils PathLookup (value_path!/.matches) -- see README. This
 /// def_path_str fallback is FRAGILE (path formatting) and only here so the
 /// scaffold has no hard clippy_utils call site to break the build before you
 /// wire PathLookup.
 fn is_lock_acquire<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
-    let p = tcx.def_path_str(did);
+    let p = strip_generics(&tcx.def_path_str(did));
     p.ends_with("Mutex::lock")
         || p.ends_with("RwLock::read")
         || p.ends_with("RwLock::write")
@@ -160,6 +194,13 @@ fn is_lock_acquire<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
                 || p.ends_with("::read_recursive")
                 || p.ends_with("::upgradable_read")))
         || (p.starts_with("spin") && (p.ends_with("::lock") || p.ends_with("::read") || p.ends_with("::write")))
+}
+
+/// True if `did` is `Result::unwrap`/`expect` -- the std lock guards are reached
+/// through exactly this call (`lock().unwrap()`), so it links result to guard.
+fn is_result_unwrap<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+    let p = strip_generics(&tcx.def_path_str(did));
+    p.ends_with("Result::unwrap") || p.ends_with("Result::expect")
 }
 
 fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
@@ -185,6 +226,10 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     let mut acquires: Vec<Acquire> = Vec::new();
     // map each guard local -> its class, so the held-set can name held guards.
     let mut guard_class: BTreeMap<Local, (String, String)> = BTreeMap::new();
+    // std lock() returns Result<Guard, _>; the guard local appears only after
+    // .unwrap()/.expect(). Track lock-result locals so the unwrap call can hand
+    // the class on to its destination (the actual guard local).
+    let mut result_class: BTreeMap<Local, (String, String)> = BTreeMap::new();
 
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // VERIFY: body.basic_blocks is a FIELD on this nightly (was a method).
@@ -195,6 +240,20 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
             let Some((callee, _generics)) = func.const_fn_def() else { continue };
             if std::env::var("WHORL_DEBUG").is_ok() {
                 eprintln!("whorl-debug: call {} in {}", tcx.def_path_str(callee), function);
+            }
+            if is_result_unwrap(tcx, callee) {
+                // `_g = Result::unwrap(move _r)`: if _r came from a lock() call,
+                // its destination _g is the guard for that lock's class.
+                if let Some(arg_local) = args
+                    .get(0)
+                    .and_then(|a| a.node.place())
+                    .map(|p| p.local)
+                {
+                    if let Some(cls) = result_class.get(&arg_local) {
+                        guard_class.insert((*destination).local, cls.clone());
+                    }
+                }
+                continue;
             }
             if !is_lock_acquire(tcx, callee) {
                 continue;
@@ -207,12 +266,12 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 None => ("<unknown-lock>".to_string(), "<unknown>".to_string()),
             };
             let loc = Location { block: bb, statement_index: data.statements.len() };
-            // The guard local is the destination's local IF its type is a guard;
-            // for std the real guard is reached after unwrap, so this may be None
-            // here -- pass 1 already enumerated guard locals by type, and we link
-            // them by class below.
+            // The guard local is the destination's local IF its type is a guard
+            // (parking_lot/spin return the guard directly); for std the guard is
+            // reached after unwrap, which result_class handles above.
             let dest_local = (*destination).local;
             let guard_local = guard_kind.get(&dest_local).map(|_| dest_local);
+            result_class.insert(dest_local, (class.clone(), base_id.clone()));
             acquires.push(Acquire { loc, class: class.clone(), base_id: base_id.clone(), guard_local });
         }
     }
