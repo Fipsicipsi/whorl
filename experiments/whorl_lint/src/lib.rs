@@ -193,6 +193,9 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
         if let TerminatorKind::Call { func, args, destination, .. } = &term.kind {
             // const_fn_def() -> Option<(DefId, GenericArgsRef)>. (verified)
             let Some((callee, _generics)) = func.const_fn_def() else { continue };
+            if std::env::var("WHORL_DEBUG").is_ok() {
+                eprintln!("whorl-debug: call {} in {}", tcx.def_path_str(callee), function);
+            }
             if !is_lock_acquire(tcx, callee) {
                 continue;
             }
