@@ -95,6 +95,66 @@ pub fn parse(src: &str) -> Result<Program, String> {
         }
     }
 
+    // Interprocedural held-sets. The MIR front-end is per-body: a guard held
+    // across a call is invisible inside the callee, which would be a false
+    // negative. It therefore also emits call edges (caller, callee, held at the
+    // call site); here we run the same monotone entry-may fixpoint as the
+    // .whorl frontend and fold each function's entry-may set into its events.
+    if let Some(Value::Arr(calls)) = top.get("calls") {
+        let mut edges = Vec::new();
+        for (idx, c) in calls.iter().enumerate() {
+            let Value::Obj(c) = c else {
+                return Err(format!("calls[{idx}] is not an object"));
+            };
+            let held = match c.get("held") {
+                Some(Value::Arr(hs)) => {
+                    let mut held = Vec::new();
+                    for h in hs {
+                        match h {
+                            Value::Str(s) => held.push(s.clone()),
+                            _ => return Err(format!("calls[{idx}].held contains a non-string")),
+                        }
+                    }
+                    held
+                }
+                _ => return Err(format!("calls[{idx}] is missing \"held\"")),
+            };
+            edges.push((
+                str_field(c, "function", idx)?,
+                str_field(c, "callee", idx)?,
+                held,
+            ));
+        }
+        let mut entry_may: HashMap<String, Vec<String>> = HashMap::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (caller, callee, held) in &edges {
+                let mut incoming = held.clone();
+                if let Some(from_caller) = entry_may.get(caller) {
+                    incoming.extend(from_caller.iter().cloned());
+                }
+                let into = entry_may.entry(callee.clone()).or_default();
+                for c in incoming {
+                    if !into.contains(&c) {
+                        into.push(c);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for e in &mut events {
+            if let Some(extra) = entry_may.get(&e.function) {
+                for c in extra {
+                    if !e.held.contains(c) {
+                        e.held.push(c.clone());
+                        class_instances.entry(c.clone()).or_insert(2);
+                    }
+                }
+            }
+        }
+    }
+
     let incomplete = match top.get("incomplete") {
         Some(Value::Str(r)) => Some(r.clone()),
         _ => None,
@@ -346,6 +406,49 @@ mod tests {
         assert!(matches!(report.outcome, Outcome::Deadlock { .. }));
         // Two assumed instances => cross-instance explanation, not reentrancy.
         assert!(!report.self_loop_single_instance);
+    }
+
+    #[test]
+    fn call_edges_propagate_held_sets_into_callees() {
+        // locker_a holds A and calls helper, which locks B; locker_b locks B
+        // then A. Without the call edge this is (unsoundly) safe; with it the
+        // helper's B acquire happens while A is held -> cycle A < B < A.
+        let src = r#"{
+  "events": [
+    { "function": "locker_a", "site": "s:1", "acquires": "A", "held": [] },
+    { "function": "helper",   "site": "s:2", "acquires": "B", "held": [] },
+    { "function": "locker_b", "site": "s:3", "acquires": "B", "held": [] },
+    { "function": "locker_b", "site": "s:4", "acquires": "A", "held": ["B"] }
+  ],
+  "class_instances": { "A": 1, "B": 1 },
+  "calls": [
+    { "function": "locker_a", "callee": "helper", "held": ["A"] }
+  ]
+}"#;
+        let prog = parse(src).unwrap();
+        let helper_event = prog.events.iter().find(|e| e.function == "helper").unwrap();
+        assert_eq!(helper_event.held, vec!["A".to_string()]);
+        let report = analyze(&prog);
+        assert!(matches!(report.outcome, Outcome::Deadlock { .. }));
+    }
+
+    #[test]
+    fn entry_may_is_transitive_over_call_chains() {
+        // a holds L and calls b; b calls c; c locks M. The L-held context must
+        // reach c through the chain.
+        let src = r#"{
+  "events": [
+    { "function": "a", "site": "s:1", "acquires": "L", "held": [] },
+    { "function": "c", "site": "s:2", "acquires": "M", "held": [] }
+  ],
+  "calls": [
+    { "function": "b", "callee": "c", "held": [] },
+    { "function": "a", "callee": "b", "held": ["L"] }
+  ]
+}"#;
+        let prog = parse(src).unwrap();
+        let c_event = prog.events.iter().find(|e| e.function == "c").unwrap();
+        assert!(c_event.held.contains(&"L".to_string()));
     }
 
     #[test]

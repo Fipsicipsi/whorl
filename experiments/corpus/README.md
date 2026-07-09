@@ -33,8 +33,12 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 12 cases, 11/12 match, 0 false negatives, 1 false
-positive. The false positive is `outer_lock_serializes.rs`, the classic Havender
+Current status on this corpus: 13 cases, 12/13 match, 0 false negatives, 1 false
+positive. The 13th case (`cross_call_deadlock.rs`) was added as a deliberate
+red test: it proved both implementations had an interprocedural false negative
+(a guard held across a call was invisible in the callee), which was then fixed
+by call-edge tracking plus an entry-may fixpoint -- in the lint/solver pipeline
+and in the PoC alike. The false positive is `outer_lock_serializes.rs`, the classic Havender
 case (two same-class locks only ever taken under a common outer lock, so the
 inversion cannot happen concurrently). It is deliberate: the strict class
 partial order rejects the program, and the honest answer is an explicit escape
@@ -49,7 +53,7 @@ ownership, so the held-set follows the value, and `mem::drop` kills it.
 `whorl --events`) on every case and cross-checks it against both the ground
 truth and the stable-MIR PoC. Two independent implementations of the same
 analysis on the same corpus is a differential test in itself: any disagreement
-is a bug in one of them. Current status: 11/12 match ground truth, 0 false
+is a bug in one of them. Current status: 12/13 match ground truth, 0 false
 negatives, 0 divergences between the two implementations; the single miss is
 the same deliberate Havender false positive in both.
 

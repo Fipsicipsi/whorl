@@ -53,9 +53,12 @@ cross-class cycle.
 
 ## Honest limits (these are why the production path is `../whorl_lint`)
 
-- **Intra-procedural only.** A guard held across a call into another function is
-  not seen as held in the callee. The real solver propagates held-sets over the
-  call graph; this probe does not.
+- **Interprocedural via direct calls only.** Calls to named local functions
+  feed an entry-may fixpoint (a guard held at a call site counts as held
+  throughout the callee, transitively), so cross-call deadlocks are caught.
+  Calls through closures, function pointers, trait objects, and methods are
+  NOT tracked here; a lock taken behind those is invisible to this probe. The
+  typed dylint pass has the same direct-call limitation for now.
 - **Move tracking is minimal.** Plain `_a = move _b` statements transfer guard
   ownership (so `std::mem::drop` releases correctly), but a guard moved into a
   struct or returned is conservatively kept in the held-set (sound, may

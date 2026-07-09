@@ -69,9 +69,18 @@ struct Event {
     held: BTreeSet<String>,
     acquires: String,
 }
+/// A call from `function` to a local `callee` with `held` guard classes live at
+/// the call site. The stable side folds these into entry-may sets so a guard
+/// held across a call is seen inside the callee (interprocedural soundness).
+struct CallEdge {
+    function: String,
+    callee: String,
+    held: BTreeSet<String>,
+}
 #[derive(Default)]
 struct ProgramOut {
     events: Vec<Event>,
+    calls: Vec<CallEdge>,
     // class symbol -> set of distinct receiver-base identities seen for it.
     // len() >= 2 => the class has >=2 instances (cross-instance inversion is
     // possible); len() == 1 => single-instance (reentrancy). Feeds
@@ -230,6 +239,9 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     // .unwrap()/.expect(). Track lock-result locals so the unwrap call can hand
     // the class on to its destination (the actual guard local).
     let mut result_class: BTreeMap<Local, (String, String)> = BTreeMap::new();
+    // call sites into functions of THIS crate: (location, callee path). The
+    // held-set at each site is looked up after the liveness fixpoint below.
+    let mut local_calls: Vec<(Location, String)> = Vec::new();
 
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // VERIFY: body.basic_blocks is a FIELD on this nightly (was a method).
@@ -256,6 +268,10 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 continue;
             }
             if !is_lock_acquire(tcx, callee) {
+                if callee.is_local() {
+                    let loc = Location { block: bb, statement_index: data.statements.len() };
+                    local_calls.push((loc, tcx.def_path_str(callee)));
+                }
                 continue;
             }
             // receiver = first arg; args[i] is Spanned<Operand> => .node. (verified)
@@ -330,6 +346,19 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 .entry(a.class.clone())
                 .or_default()
                 .insert(a.base_id.clone());
+        }
+        for (loc, callee) in &local_calls {
+            let mut held: BTreeSet<String> = BTreeSet::new();
+            for gl in live.get(loc).cloned().unwrap_or_default() {
+                if let Some((cls, _)) = guard_class.get(&gl) {
+                    held.insert(cls.clone());
+                }
+            }
+            prog.calls.push(CallEdge {
+                function: function.clone(),
+                callee: callee.clone(),
+                held,
+            });
         }
     });
 }
@@ -584,7 +613,22 @@ fn write_events<'tcx>(_tcx: TyCtxt<'tcx>) {
                 if i + 1 == n { "" } else { "," }
             );
         }
-        out.push_str("  }");
+        out.push_str("  },
+  \"calls\": [
+");
+        for (i, c) in prog.calls.iter().enumerate() {
+            let held: Vec<String> = c.held.iter().map(|h| jstr(h)).collect();
+            let _ = write!(
+                out,
+                "    {{ \"function\": {}, \"callee\": {}, \"held\": [{}] }}{}
+",
+                jstr(&c.function),
+                jstr(&c.callee),
+                held.join(", "),
+                if i + 1 == prog.calls.len() { "" } else { "," }
+            );
+        }
+        out.push_str("  ]");
         if let Some(reason) = &prog.incomplete {
             let _ = write!(out, ",\n  \"incomplete\": {}", jstr(reason));
         }

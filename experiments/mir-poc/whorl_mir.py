@@ -25,6 +25,10 @@ MEMDROP = re.compile(r'(?:std|core)::mem::drop::<.*?>\((?:move|copy) (_\d+)\)')
 # held-set following the value (sound), so mem::drop of the moved-to temp
 # releases the right guard.
 MOVE   = re.compile(r'^\s*(_\d+) = move (_\d+);')
+# `_5 = helper(copy _1) -> ...` -- a call to another function in the same file.
+# Only names that are local functions count (checked against split_fns keys);
+# the held-set at the call site feeds the interprocedural entry-may fixpoint.
+CALL   = re.compile(r'_\d+ = (\w+)\((?:move|copy) ')
 FN     = re.compile(r'^fn (\w+)\(')
 BB     = re.compile(r'^\s*bb(\d+): \{')
 SUCC   = re.compile(r'bb(\d+)')
@@ -44,7 +48,7 @@ def split_fns(text):
             if ln == '}': out[name] = cur; name = None
     return out
 
-def parse_fn(lines):
+def parse_fn(lines, local_fns=frozenset()):
     recv, blocks, cur = {}, {}, None
     for ln in lines:
         bm = BB.match(ln)
@@ -63,13 +67,17 @@ def parse_fn(lines):
                 else:
                     m = MEMDROP.search(ln) or DROP.search(ln)
                     if m: blocks[cur]['eff'].append(('drop', m.group(1)))
+                    else:
+                        m = CALL.search(ln)
+                        if m and m.group(1) in local_fns:
+                            blocks[cur]['eff'].append(('call', m.group(1)))
         if '->' in ln:
             for s in SUCC.findall(ln.split('->', 1)[1]): blocks[cur]['succ'].append(int(s))
     return blocks
 
-def analyze_fn(name, lines):
-    blocks = parse_fn(lines)
-    if not blocks: return []
+def analyze_fn(name, lines, local_fns=frozenset()):
+    blocks = parse_fn(lines, local_fns)
+    if not blocks: return [], []
     preds = collections.defaultdict(list)
     for b, info in blocks.items():
         for s in info['succ']:
@@ -86,7 +94,7 @@ def analyze_fn(name, lines):
                 if e[2] in st and e[2] in gclass:
                     gclass[e[1]] = gclass[e[2]]; st.discard(e[2]); st.add(e[1])
             elif e[0] == 'drop': st.discard(e[1])
-        return frozenset(st)
+        return frozenset(st)  # 'call' effects do not change guard liveness
     IN = {b: frozenset() for b in blocks}; OUT = dict(IN)
     changed = True
     while changed:
@@ -95,7 +103,7 @@ def analyze_fn(name, lines):
             ins = frozenset() if (b == entry or not preds[b]) else frozenset().union(*[OUT[p] for p in preds[b]])
             o = transfer(b, ins)
             if ins != IN[b] or o != OUT[b]: IN[b] = ins; OUT[b] = o; changed = True
-    events = []
+    events, calls = [], []
     for b in sorted(blocks):
         st = set(IN[b])
         for e in blocks[b]['eff']:
@@ -106,13 +114,31 @@ def analyze_fn(name, lines):
             elif e[0] == 'move':
                 if e[2] in st and e[2] in gclass: st.discard(e[2]); st.add(e[1])
             elif e[0] == 'drop': st.discard(e[1])
-    return events
+            elif e[0] == 'call':
+                held = sorted({gclass[g] for g in st if g in gclass})
+                calls.append((name, held, e[1]))
+    return events, calls
 
 def analyze_text(text):
-    evs = []
-    for name, lines in split_fns(text).items():
-        evs += analyze_fn(name, lines)
-    return evs
+    fns = split_fns(text)
+    local = frozenset(fns)
+    evs, calls = [], []
+    for name, lines in fns.items():
+        e, c = analyze_fn(name, lines, local)
+        evs += e
+        calls += c
+    # Interprocedural entry-may fixpoint (same as the .whorl frontend): a guard
+    # held at a call site is held throughout the callee, transitively.
+    entry = collections.defaultdict(set)
+    changed = True
+    while changed:
+        changed = False
+        for caller, held, callee in calls:
+            incoming = set(held) | entry[caller]
+            if not incoming <= entry[callee]:
+                entry[callee] |= incoming
+                changed = True
+    return [(fn, sorted(set(held) | entry[fn]), acq) for fn, held, acq in evs]
 
 def verdict(events):
     """Return (label, detail). Same Havender model as whorl::solver."""
