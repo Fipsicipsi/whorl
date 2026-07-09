@@ -1,0 +1,5 @@
+[target.'cfg(all())']
+rustflags = ["-C", "linker=dylint-link"]
+# Rust >= 1.74 alternative (cargo PR 12535), pick ONE:
+# [target.x86_64-pc-windows-msvc]
+# linker = "dylint-link"

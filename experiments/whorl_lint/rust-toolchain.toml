@@ -1,0 +1,6 @@
+# Co-versioned with dylint_linting 6.0.1 and the clippy_utils rev in Cargo.toml.
+# The template ships [llvm-tools-preview, rustc-dev]; rust-src is added because we
+# read the source map for site spans and may normalize types.
+[toolchain]
+channel = "nightly-2026-04-16"
+components = ["llvm-tools-preview", "rustc-dev", "rust-src"]

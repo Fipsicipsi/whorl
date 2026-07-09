@@ -1,0 +1,4 @@
+*.mir
+__pycache__/
+*.pyc
+whorl-events.json

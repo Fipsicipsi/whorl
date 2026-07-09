@@ -1,0 +1,27 @@
+[package]
+name = "whorl_lint"
+version = "0.1.0"
+authors = ["felix"]
+description = "Whorl MIR front-end: emits per-acquisition (lock-class, held-set) events for the Havender solver"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# CO-VERSIONED TRIPLE: this clippy_utils rev, the dylint_linting version, and the
+# rust-toolchain nightly date MUST move together. Re-pull all three from the
+# trailofbits/dylint template at the tag you install. Verified verbatim against
+# the live template on 2026-06-29.
+clippy_utils = { git = "https://github.com/rust-lang/rust-clippy", rev = "f6d310692116e9a527ce6d0b3526c965d9c5d7b9" }
+dylint_linting = "6.0.1"
+
+[dev-dependencies]
+dylint_testing = "6.0.1"
+
+# Empty table => this crate is its own workspace, decoupled from ../whorl.
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
