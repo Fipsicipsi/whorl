@@ -57,22 +57,41 @@ is a bug in one of them. Current status: 12/13 match ground truth, 0 false
 negatives, 0 divergences between the two implementations; the single miss is
 the same deliberate Havender false positive in both.
 
-## The `lockbud` column (Direction 2: earn the claim)
+## The `lockbud` head-to-head (`run_lockbud.py`) -- Direction 2, run
 
-The runner prints a `lockbud` column held at `TBD`. Filling it is the head-to-head
-that turns "argued soundness" into "earned soundness":
+Lockbud (`github.com/BurtonQin/lockbud`) is the established static Rust deadlock
+detector and an unsound bug-finder by design. `run_lockbud.py` runs it on every
+case next to the Whorl verdict. Result on this corpus:
 
-1. Install Lockbud (`github.com/BurtonQin/lockbud`) -- it ships its own rustc
-   driver and pins its own nightly; follow its README (do not mix its nightly
-   with the dylint template's nightly used by `../whorl_lint`).
-2. Run it on each case and record its verdict.
-3. Compare. Lockbud is an unsound bug-finder by design, so the thesis to validate
-   is: "Whorl flags what Lockbud misses (no false negatives), and Whorl's false
-   positives are bounded and explainable." That table is the pitch and the paper.
+```
+whorl false negatives: 0   | lockbud false negatives: 2 | lockbud false positives: 1
+```
 
-A natural next step is to add the published Lockbud / Archerfish real-world bugs
-as cases, and adversarial cases that target Whorl's own predicted false positives
-(the strict class partial order), so the escape-hatch story stays honest.
+Lockbud misses `two_account_deadlock.rs` -- the canonical textbook deadlock --
+and `branch_deadlock.rs`. Both misses are the same systematic blind spot: its
+DoubleLock detector needs the SAME lock twice and its ConflictLock detector
+needs an inverted order between two DISTINCT named locks, so an unordered
+acquisition of two instances of the same lock class falls through both. That
+class-level case is exactly what Whorl's lock-class abstraction (plus the
+instance count) exists to catch. Notably, on `outer_lock_serializes.rs` (the
+deliberate Havender false positive) lockbud reports the same false positive.
+
+The thesis this table exists to test holds on this corpus: Whorl misses
+nothing; its one false positive is deliberate, explained, and shared by the
+incumbent. The corpus is small; the next step is scale, not celebration --
+add the published Lockbud/Archerfish real-world bugs as cases and grow the
+SAFE side with real driver/HAL-shaped code.
+
+Reproducing: build lockbud from its repo with its own pinned nightly
+(2026-02-07 -- do NOT mix it with the dylint template's nightly). As of
+2026-07, lockbud master needs four small fixes to build on its own pinned
+toolchain (its code lags the pin): `extern crate rustc_hash` is ambiguous
+(the toolchain ships two rustc-hash rmetas) -- use
+`rustc_data_structures::fx` instead; `StatementKind::Deinit` and
+`MutatingUseContext::Deinit` were removed; `Operand::RuntimeChecks` is a new
+match arm; `Input::source_name()` is gone (match `Input::File`/`Input::Str`);
+`rustc_driver::catch_with_exit_code` now returns `ExitCode` (return it from
+`main`).
 
 ## Caveats
 
