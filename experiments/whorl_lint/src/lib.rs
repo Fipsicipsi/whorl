@@ -22,9 +22,7 @@ extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_middle;
 extern crate rustc_span;
-// rustc_driver is pulled in by the macro expansion below; declaring it keeps the
-// `unused_extern_crates` lint quiet and matches the template.
-extern crate rustc_driver;
+// rustc_driver is declared by the declare_late_lint! expansion below.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -237,7 +235,7 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
 
     // --- pass 3: gen/kill liveness of guard locals -----------------------------
     let guard_locals: BTreeSet<Local> = guard_kind.keys().copied().collect();
-    let mut gk = GuardGenKill { guards: &guard_locals, gen: BTreeMap::new(), kill: BTreeMap::new() };
+    let mut gk = GuardGenKill { guards: &guard_locals, gens: BTreeMap::new(), kill: BTreeMap::new() };
     gk.visit_body(body);
 
     // Forward may-live fixpoint over basic blocks; join = UNION (sound upper
@@ -363,9 +361,17 @@ fn span_to_site<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, loc: Location) -> St
     // Either combinators above (map_left/map_right/either) are from the `either`
     // re-export rustc uses -- confirm method names, or replace with manual
     // indexing: body.basic_blocks[loc.block].statements.get(idx).
+    // FileName::prefer_local()/FileNameDisplayPreference are gone or private on
+    // this nightly; match the Real variant directly and fall back to Debug.
     let sm = tcx.sess.source_map();
     let lo = sm.lookup_char_pos(src_info.span.lo());
-    let file = lo.file.name.prefer_local().to_string();
+    let file = match &lo.file.name {
+        rustc_span::FileName::Real(real) => match real.local_path() {
+            Some(p) => p.display().to_string(),
+            None => format!("{real:?}"),
+        },
+        other => format!("{other:?}"),
+    };
     format!("{}:{}", file, lo.line)
 }
 
@@ -373,7 +379,7 @@ fn span_to_site<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, loc: Location) -> St
 // ---- version-fragile per the verifier; the bare Visitor is stable). ----------
 struct GuardGenKill<'a> {
     guards: &'a BTreeSet<Local>,
-    gen: BTreeMap<Location, BTreeSet<Local>>,
+    gens: BTreeMap<Location, BTreeSet<Local>>,
     kill: BTreeMap<Location, BTreeSet<Local>>,
 }
 impl<'a, 'tcx> Visitor<'tcx> for GuardGenKill<'a> {
@@ -384,7 +390,7 @@ impl<'a, 'tcx> Visitor<'tcx> for GuardGenKill<'a> {
         match ctx {
             PlaceContext::MutatingUse(MutatingUseContext::Store)
             | PlaceContext::MutatingUse(MutatingUseContext::Call) => {
-                self.gen.entry(loc).or_default().insert(local);
+                self.gens.entry(loc).or_default().insert(local);
             }
             PlaceContext::MutatingUse(MutatingUseContext::Drop)
             | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) => {
@@ -437,7 +443,7 @@ fn solve_live<'tcx>(
                 // exit state of pred = recompute by stepping it; cheap enough for
                 // a scaffold. We recompute pred exit from its entry below in the
                 // same pass by reading entry[p] and applying its gen/kill.
-                state.extend(block_exit(body, gk, p, &entry[p as usize.into()]));
+                state.extend(block_exit(body, gk, p, &entry[<BasicBlock as Into<usize>>::into(p)]));
             }
             if state != entry[<BasicBlock as Into<usize>>::into(bb)] {
                 entry[<BasicBlock as Into<usize>>::into(bb)] = state.clone();
@@ -453,7 +459,7 @@ fn solve_live<'tcx>(
                         cur.remove(l);
                     }
                 }
-                if let Some(g) = gk.gen.get(&loc) {
+                if let Some(g) = gk.gens.get(&loc) {
                     cur.extend(g.iter().copied());
                 }
             }
@@ -479,7 +485,7 @@ fn block_exit<'tcx>(
                 cur.remove(l);
             }
         }
-        if let Some(g) = gk.gen.get(&loc) {
+        if let Some(g) = gk.gens.get(&loc) {
             cur.extend(g.iter().copied());
         }
     }
