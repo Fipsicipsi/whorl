@@ -386,20 +386,38 @@ fn lock_class_of_receiver<'tcx>(
         }
     }
     // Build a stable symbol from the base local's TYPE + the projection chain.
+    // We walk the type alongside the projections so field components can carry
+    // their SOURCE name (`.bal`) instead of a positional `.f0`.
     let base_ty = body.local_decls[cur.local].ty;
+    let mut cur_ty = base_ty;
     let mut sym = String::new();
     let _ = write!(sym, "{}", base_ty);
     let mut base_id = format!("{}#{}", base_ty, cur.local.as_u32());
     for elem in cur.projection {
         match elem {
             // Field path is the heart of the class abstraction (the .0 in
-            // `(*_1).0: Mutex<T>`). FieldIdx -> a class component.
+            // `(*_1).0: Mutex<T>`). Resolve the field's source name from the
+            // ADT definition; fall back to the positional index.
             PlaceElem::Field(f, fty) => {
-                let _ = write!(sym, ".f{}:{}", f.as_u32(), fty);
-                let _ = write!(base_id, ".f{}", f.as_u32());
+                let name = match cur_ty.kind() {
+                    ty::TyKind::Adt(adt, _) if adt.is_struct() => adt
+                        .non_enum_variant()
+                        .fields
+                        .get(f)
+                        .map(|fd| fd.name.to_string()),
+                    _ => None,
+                };
+                let name = name.unwrap_or_else(|| format!("f{}", f.as_u32()));
+                let _ = write!(sym, ".{name}:{fty}");
+                let _ = write!(base_id, ".{name}");
+                cur_ty = fty;
             }
             PlaceElem::Deref => {
                 sym.push_str(".*");
+                // Peel the reference/box so the next Field sees the ADT.
+                if let ty::TyKind::Ref(_, inner, _) = cur_ty.kind() {
+                    cur_ty = *inner;
+                }
             }
             // Index/Subslice etc.: collapse (cannot distinguish instances soundly
             // here -> coarser class, still sound for ordering).
