@@ -14,6 +14,17 @@ RECV   = re.compile(r'(_\d+) = &\((.*?): std::sync::(Mutex|RwLock)<(.*?)>\);')
 LOCK   = re.compile(r'(_\d+) = std::sync::(?:Mutex|RwLock)::<.*?>::(?:lock|read|write)\((?:move|copy) (_\d+)\)')
 UNWRAP = re.compile(r'(_\d+) = .*?unwrap\((?:move|copy) (_\d+)\)')
 DROP   = re.compile(r'drop\((_\d+)\)')
+# std::mem::drop consumes the guard by move; no drop(_g) terminator remains in
+# this body afterwards. Treating it as a kill is sound because mem::drop
+# definitively destroys its argument. (A general move-out must NOT kill: the
+# guard may live on elsewhere, and dropping it from the held-set would be a
+# false negative.)
+MEMDROP = re.compile(r'(?:std|core)::mem::drop::<.*?>\((?:move|copy) (_\d+)\)')
+# `_a = move _b;` -- guards are not Copy, so a plain move statement transfers
+# ownership: the guard now lives in _a and _b is dead. Tracking this keeps the
+# held-set following the value (sound), so mem::drop of the moved-to temp
+# releases the right guard.
+MOVE   = re.compile(r'^\s*(_\d+) = move (_\d+);')
 FN     = re.compile(r'^fn (\w+)\(')
 BB     = re.compile(r'^\s*bb(\d+): \{')
 SUCC   = re.compile(r'bb(\d+)')
@@ -47,8 +58,11 @@ def parse_fn(lines):
             m = UNWRAP.search(ln)
             if m: blocks[cur]['eff'].append(('unwrap', m.group(1), m.group(2)))
             else:
-                m = DROP.search(ln)
-                if m: blocks[cur]['eff'].append(('drop', m.group(1)))
+                m = MOVE.match(ln)
+                if m: blocks[cur]['eff'].append(('move', m.group(1), m.group(2)))
+                else:
+                    m = MEMDROP.search(ln) or DROP.search(ln)
+                    if m: blocks[cur]['eff'].append(('drop', m.group(1)))
         if '->' in ln:
             for s in SUCC.findall(ln.split('->', 1)[1]): blocks[cur]['succ'].append(int(s))
     return blocks
@@ -68,6 +82,9 @@ def analyze_fn(name, lines):
             if e[0] == 'lock': pending[e[1]] = e[2]
             elif e[0] == 'unwrap':
                 if e[2] in pending: gclass[e[1]] = pending[e[2]]; st.add(e[1])
+            elif e[0] == 'move':
+                if e[2] in st and e[2] in gclass:
+                    gclass[e[1]] = gclass[e[2]]; st.discard(e[2]); st.add(e[1])
             elif e[0] == 'drop': st.discard(e[1])
         return frozenset(st)
     IN = {b: frozenset() for b in blocks}; OUT = dict(IN)
@@ -86,6 +103,8 @@ def analyze_fn(name, lines):
                 held = sorted({gclass[g] for g in st if g in gclass})
                 events.append((name, held, e[2]))
             elif e[0] == 'unwrap' and e[2] in pending and e[1] in gclass: st.add(e[1])
+            elif e[0] == 'move':
+                if e[2] in st and e[2] in gclass: st.discard(e[2]); st.add(e[1])
             elif e[0] == 'drop': st.discard(e[1])
     return events
 

@@ -56,6 +56,10 @@ cross-class cycle.
 - **Intra-procedural only.** A guard held across a call into another function is
   not seen as held in the callee. The real solver propagates held-sets over the
   call graph; this probe does not.
+- **Move tracking is minimal.** Plain `_a = move _b` statements transfer guard
+  ownership (so `std::mem::drop` releases correctly), but a guard moved into a
+  struct or returned is conservatively kept in the held-set (sound, may
+  over-report).
 - **Positional field names.** Classes are `field0`, not `bal`; the MIR text does
   not carry source field names. The typed dylint pass recovers real names.
 - **Text parsing is a shortcut.** Robust extraction wants in-memory typed MIR

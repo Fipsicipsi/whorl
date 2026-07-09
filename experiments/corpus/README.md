@@ -33,7 +33,15 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 8/8 match, 0 false negatives, 0 false positives.
+Current status on this corpus: 12 cases, 11/12 match, 0 false negatives, 1 false
+positive. The false positive is `outer_lock_serializes.rs`, the classic Havender
+case (two same-class locks only ever taken under a common outer lock, so the
+inversion cannot happen concurrently). It is deliberate: the strict class
+partial order rejects the program, and the honest answer is an explicit escape
+hatch (`with ordered(..)` / a trusted annotation), not a weakened verdict.
+A second predicted false positive (guard released via `std::mem::drop`) was
+fixed by sound move-tracking: a `_a = move _b` statement transfers guard
+ownership, so the held-set follows the value, and `mem::drop` kills it.
 
 ## The `lockbud` column (Direction 2: earn the claim)
 
