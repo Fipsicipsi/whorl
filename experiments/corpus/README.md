@@ -93,6 +93,48 @@ match arm; `Input::source_name()` is gone (match `Input::File`/`Input::Str`);
 `rustc_driver::catch_with_exit_code` now returns `ExitCode` (return it from
 `main`).
 
+## Lockbud's own toys (`run_toys.py`)
+
+The strongest test is someone else's ground truth. `run_toys.py` runs the Whorl
+pipeline on the lock-ordering cases from lockbud's own `toys/` directory --
+programs written by lockbud's authors, not us. Result:
+
+```
+lockbud-toys | whorl false negatives: 0 | false positives: 2
+```
+
+Whorl catches all six labeled deadlocks, including ones that exercise features
+beyond the hand-written corpus: a three-class cycle (`conflict`), an
+interprocedural cycle that only closes through a call (`conflict-inter`,
+via the call-edge fixpoint), a double-lock hidden behind `.ok().unwrap()` on a
+match temporary (`intra`), a `lazy_static!` static (`static-ref`), and an
+inversion split across two `thread::spawn` closures (`lock-closure`, caught
+because closures are separate MIR bodies).
+
+`static-ref` first ICEd the lint: `lazy_static!` emits `static`/`const` items,
+and `optimized_mir` is the wrong query for those (they use `mir_for_ctfe`).
+Fixed by gating body iteration on `DefKind::{Fn, AssocFn, Closure}` -- the
+standard robustness guard. An analyzer must never crash on real input; at worst
+it reports `[INCOMPLETE]`.
+
+The two false positives are both the sound-over-precise trade, the same family
+as the Havender case above:
+
+- `call-no-deadlock`: two distinct local `Mutex<i32>` values. With no field path
+  to tell them apart, the type-based class abstraction merges them into one
+  class, so locking both nested reads as a same-class self-edge. Distinguishing
+  the instances needs points-to/alias analysis (what lockbud does); Whorl
+  deliberately trades that away for soundness.
+- `recursive-no-deadlock`: `read()` then `read_recursive()` on one parking_lot
+  `RwLock`. `read_recursive` is safe by construction, but Whorl does not model
+  read/write/recursive semantics and treats every acquire as exclusive -- the
+  conservative direction (a plain `read()` while holding a `read()` on
+  `std::sync::RwLock` genuinely can deadlock against a waiting writer).
+
+Reproducing needs a lockbud checkout (`LOCKBUD_SRC`, default `../../../lockbud-src`)
+for the toy sources; the toys pull `parking_lot`/`spin`/`lazy_static` from
+crates.io on first run.
+
 ## Caveats
 
 This corpus is tiny. Thirteen labeled cases beat zero, and the head-to-head

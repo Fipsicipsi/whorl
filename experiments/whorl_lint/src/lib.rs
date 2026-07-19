@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::visit::{
@@ -102,8 +103,18 @@ impl<'tcx> LateLintPass<'tcx> for WhorlLockOrder {
         // MIR. (verified present on TyCtxt)
         for &ldid in tcx.mir_keys(()) {
             let did = ldid.to_def_id();
+            // Only function-like bodies. optimized_mir is the WRONG query for
+            // const/static items (they use mir_for_ctfe) and calling it on them
+            // ICEs -- lazy_static! generates exactly such statics. Gating on
+            // DefKind is the standard robustness guard (clippy/lockbud do this).
+            if !matches!(
+                tcx.def_kind(did),
+                DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+            ) {
+                continue;
+            }
             if !tcx.is_mir_available(did) {
-                continue; // avoid ICE on foreign/const/shim items
+                continue; // foreign/shim items without a body
             }
             // optimized_mir: post-borrowck, post-drop-elaboration, so RAII guard
             // unlocks are explicit Drop terminators. (verified present)
