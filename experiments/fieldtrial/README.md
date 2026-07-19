@@ -52,13 +52,14 @@ dominant primitives are:
 - `spin::Mutex` and `spin::RwLock` ARE recognized (the `inter` toy proves the
   pipeline catches a spin deadlock end to end).
 
-So the pipeline is real and robust on `std`/`parking_lot`/`spin`, but the actual
-embedded wedge needs first-class support for the critical-section pattern:
-model `borrow(cs)` as an acquisition whose "held" region is the lifetime of the
-`&T`, and treat the `CriticalSection` token itself as the interrupt-masking
-resource (which ties directly into Whorl's ISR/`mask` deadlock class). That is
-the concrete next step for the embedded target, and it is a matcher/front-end
-change, not a change to the solver.
+So the pipeline is real and robust on `std`/`parking_lot`/`spin`. The
+critical-section pattern is now supported too (see `../embedded`): entering
+`critical_section::with` / `interrupt::free` is modelled as one reentrant
+`<critical-section>` resource, flowed into the masked closure body, so a
+spinlock taken inside a section and a section entered while holding that
+spinlock form a detected cycle. This was a front-end change only; the solver
+was untouched. What remains for a true field trial in the target domain is a
+real `no_std` HAL crate, which needs a cross-compilation target installed.
 
 ## Next field-trial targets
 

@@ -18,8 +18,9 @@ internals, so it is intentionally kept out of the stable build and CI.
 ## What it does
 
 It is a `dylint` `LateLintPass` that walks real Rust **MIR** and, for every lock
-acquisition (`std`/`parking_lot`/`spin` `Mutex::lock`, `RwLock::read/write`),
-emits a Whorl event:
+acquisition (`std`/`parking_lot`/`spin` `Mutex::lock`, `RwLock::read/write`, and
+`critical_section::with` / `interrupt::free` as a single reentrant
+`<critical-section>` resource -- see `../embedded`), emits a Whorl event:
 
 - **`acquires`** -- the lock **CLASS** of the lock taken, recovered by
   canonicalizing the receiver `Place` (base type + field-path/static identity).

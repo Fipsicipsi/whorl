@@ -155,6 +155,17 @@ pub fn parse(src: &str) -> Result<Program, String> {
         }
     }
 
+    // The critical section is reentrant on a single core: entering it while
+    // already inside it is not a deadlock, so it must never self-edge. The
+    // interprocedural widening above can put "<critical-section>" into the
+    // held-set of a nested entry; drop it there. Cross-class edges (a spinlock
+    // held across it, or taken inside it) are untouched.
+    for e in &mut events {
+        if e.acquires == "<critical-section>" {
+            e.held.retain(|h| h != "<critical-section>");
+        }
+    }
+
     let incomplete = match top.get("incomplete") {
         Some(Value::Str(r)) => Some(r.clone()),
         _ => None,
@@ -449,6 +460,45 @@ mod tests {
         let prog = parse(src).unwrap();
         let c_event = prog.events.iter().find(|e| e.function == "c").unwrap();
         assert!(c_event.held.contains(&"L".to_string()));
+    }
+
+    #[test]
+    fn critical_section_vs_spinlock_cycle() {
+        // cs_then_spin: enter CS, then lock spin inside the closure -> CS < spin.
+        // spin_then_cs: hold spin, then enter CS -> spin < CS. Cycle => deadlock.
+        let src = r#"{
+  "events": [
+    { "function": "cs_then_spin",             "site": "s:1", "acquires": "<critical-section>", "held": [] },
+    { "function": "cs_then_spin::{closure#0}", "site": "s:2", "acquires": "spin",               "held": [] },
+    { "function": "spin_then_cs",              "site": "s:3", "acquires": "spin",               "held": [] },
+    { "function": "spin_then_cs",              "site": "s:4", "acquires": "<critical-section>", "held": ["spin"] }
+  ],
+  "calls": [
+    { "function": "cs_then_spin", "callee": "cs_then_spin::{closure#0}", "held": ["<critical-section>"] }
+  ]
+}"#;
+        let prog = parse(src).unwrap();
+        let report = analyze(&prog);
+        assert!(matches!(report.outcome, Outcome::Deadlock { .. }));
+    }
+
+    #[test]
+    fn nested_critical_sections_are_reentrant() {
+        // A `with` inside a `with`: the inner entry inherits <critical-section>
+        // from the outer via the call edge, but re-entering is not a deadlock.
+        let src = r#"{
+  "events": [
+    { "function": "outer::{closure#0}", "site": "s:2", "acquires": "<critical-section>", "held": [] }
+  ],
+  "calls": [
+    { "function": "f",                  "callee": "outer::{closure#0}", "held": ["<critical-section>"] }
+  ]
+}"#;
+        let prog = parse(src).unwrap();
+        let e = &prog.events[0];
+        assert!(!e.held.contains(&"<critical-section>".to_string()));
+        let report = analyze(&prog);
+        assert!(matches!(report.outcome, Outcome::DeadlockFree { .. }));
     }
 
     #[test]

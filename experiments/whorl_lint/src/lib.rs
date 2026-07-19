@@ -223,6 +223,39 @@ fn is_result_unwrap<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
     p.ends_with("Result::unwrap") || p.ends_with("Result::expect")
 }
 
+/// The single global critical-section resource (interrupts disabled). Every
+/// `critical_section::Mutex` / `cortex_m::interrupt::Mutex` is guarded by THIS
+/// one lock, so it is one reentrant class, not one class per Mutex. Entering it
+/// while holding another lock, and taking another lock while inside it, are what
+/// create ordering edges -- the classic single-core critical-section-vs-spinlock
+/// deadlock.
+const CS_CLASS: &str = "<critical-section>";
+
+/// True if `did` enters a critical section (masks interrupts) and runs a closure
+/// inside it: `critical_section::with` or `cortex_m::interrupt::free`.
+fn is_critical_section_enter<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+    let p = strip_generics(&tcx.def_path_str(did));
+    p == "critical_section::with"
+        || p.ends_with("::interrupt::free")
+        || p.ends_with("interrupt::free")
+}
+
+/// The def path of the closure (or fn) an operand refers to, so a call edge can
+/// target the masked region's body. Critical-section entries take the closure by
+/// value, so its type is `ty::Closure(def_id, _)`.
+fn callee_body_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    op: &Operand<'tcx>,
+) -> Option<String> {
+    match op.ty(&body.local_decls, tcx).kind() {
+        ty::TyKind::Closure(did, _) | ty::TyKind::FnDef(did, _) => {
+            Some(tcx.def_path_str(*did))
+        }
+        _ => None,
+    }
+}
+
 fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     let function = tcx.def_path_str(owner.to_def_id());
 
@@ -253,6 +286,10 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     // call sites into functions of THIS crate: (location, callee path). The
     // held-set at each site is looked up after the liveness fixpoint below.
     let mut local_calls: Vec<(Location, String)> = Vec::new();
+    // critical_section::with / interrupt::free sites: (location, closure path).
+    // Entering masks interrupts (an acquire of CS_CLASS); the closure body runs
+    // with CS held, so the critical section flows into it as a call edge.
+    let mut cs_enters: Vec<(Location, String)> = Vec::new();
 
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // VERIFY: body.basic_blocks is a FIELD on this nightly (was a method).
@@ -275,6 +312,15 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                     if let Some(cls) = result_class.get(&arg_local) {
                         guard_class.insert((*destination).local, cls.clone());
                     }
+                }
+                continue;
+            }
+            if is_critical_section_enter(tcx, callee) {
+                // The masked region is the closure argument. Record it so the
+                // critical section can be flowed into that body below.
+                if let Some(closure) = args.first().and_then(|a| callee_body_path(tcx, body, &a.node)) {
+                    let loc = Location { block: bb, statement_index: data.statements.len() };
+                    cs_enters.push((loc, closure));
                 }
                 continue;
             }
@@ -369,6 +415,37 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 function: function.clone(),
                 callee: callee.clone(),
                 held,
+            });
+        }
+        for (loc, closure) in &cs_enters {
+            // held locks at the point interrupts are masked: each `h` becomes an
+            // ordering edge `h < CS` (e.g. spinlock < critical-section).
+            let mut held: BTreeSet<String> = BTreeSet::new();
+            for gl in live.get(loc).cloned().unwrap_or_default() {
+                if let Some((cls, _)) = guard_class.get(&gl) {
+                    held.insert(cls.clone());
+                }
+            }
+            let site = span_to_site(tcx, body, *loc);
+            prog.events.push(Event {
+                function: function.clone(),
+                site,
+                held: held.clone(),
+                acquires: CS_CLASS.to_string(),
+            });
+            // one global critical section => a single instance.
+            prog.class_instances
+                .entry(CS_CLASS.to_string())
+                .or_default()
+                .insert("<global>".to_string());
+            // the closure runs with the critical section (and everything already
+            // held) live, so a lock taken inside it gets `CS < that-lock`.
+            let mut into = held;
+            into.insert(CS_CLASS.to_string());
+            prog.calls.push(CallEdge {
+                function: function.clone(),
+                callee: closure.clone(),
+                held: into,
             });
         }
     });
