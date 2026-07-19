@@ -61,9 +61,38 @@ spinlock form a detected cycle. This was a front-end change only; the solver
 was untouched. What remains for a true field trial in the target domain is a
 real `no_std` HAL crate, which needs a cross-compilation target installed.
 
+## Second trial: real `no_std`, the real `cortex-m` crate, a real target
+
+The follow-up ran in the actual target domain. A `#![no_std]` crate depending on
+the real `cortex-m` crate (0.7), compiled for `thumbv7em-none-eabihf` (the target
+installed with `rustup target add`), using `cortex_m::interrupt::free` and
+`cortex_m::interrupt::Mutex` -- the genuine embedded primitives, not a mock:
+
+```rust
+static SHARED: Mutex<Cell<u32>> = Mutex::new(Cell::new(0));   // cortex_m interrupt Mutex
+static BUS: spin::Mutex<u32> = spin::Mutex::new(0);
+pub fn task_write()   { interrupt::free(|cs| { let b = BUS.lock(); SHARED.borrow(cs).set(*b); }); }
+pub fn driver_flush() { let b = BUS.lock(); interrupt::free(|cs| { SHARED.borrow(cs).set(*b); }); }
+```
+
+The lint compiled the crate for the thumb target without an ICE, recognized the
+real `cortex_m::interrupt::free` as a critical-section entry, flowed the section
+into the closure body, and reported the inversion:
+
+```
+[DEADLOCK]
+  <critical-section>  <  spin::Mutex   via task_write::{closure#0}
+  spin::Mutex  <  <critical-section>   via driver_flush
+```
+
+That is the actual embedded hazard -- an interrupt firing while a driver holds
+the bus spinlock, where the masked path then needs that same spinlock -- caught
+on real no_std code, for a real embedded target, using the real cortex-m API.
+`cargo dylint --all --path ../whorl_lint -- --target thumbv7em-none-eabihf`.
+
 ## Next field-trial targets
 
-- A crate with genuine nested locking, to exercise false-positive behavior on
-  real code (tracing-core never nests, so it could not).
-- A real `no_std` HAL/RTOS crate once `critical_section` is supported -- the
-  first trial in the actual target domain.
+- A crate with genuine nested `std` locking, to exercise false-positive behavior
+  on real code (tracing-core never nests, so it could not).
+- Making a full HAL/PAC (nrf/stm32/rp2040) the analyzed crate rather than a
+  dependency, to run the lint over thousands of lines of generated no_std code.
