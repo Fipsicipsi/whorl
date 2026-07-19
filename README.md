@@ -8,14 +8,22 @@ annotations, and the guarantee is fully static with no runtime cost.
 
 ## Status
 
-Whorl is a research prototype. It is its own small language, not yet a tool for
-analyzing existing Rust or C codebases. A `[SAFE]` verdict means "no
-lock-ordering deadlock", not "cannot deadlock": condition variables, channel and
-actor cycles, external resources, and multicore preemption are out of scope. The
-soundness guarantee is argued and tested, not yet mechanically proven
-(development found and fixed 7 soundness bugs across 8 review passes). Read
-[SECURITY.md](SECURITY.md) before relying on a verdict, and
-[docs/ROADMAP.md](docs/ROADMAP.md) for the path from prototype to product.
+Whorl is a research prototype. The stable crate here is its own small language
+plus the solver. A separate, experimental front-end under
+[experiments/](experiments/) now runs the same analysis on **real Rust** via a
+`dylint` MIR pass: it is validated head to head against Lockbud (0 vs 2 false
+negatives on a labeled corpus), runs clean on `tracing-core`, and catches a
+single-core critical-section-vs-spinlock deadlock on real `cortex-m` `no_std`
+code. See [docs/compile-time-lockdep.md](docs/compile-time-lockdep.md) for what
+that is and the evidence behind it.
+
+A `[SAFE]` verdict means "no lock-ordering deadlock", not "cannot deadlock":
+condition variables, channel and actor cycles, external resources, and multicore
+preemption are out of scope. The soundness guarantee is argued and tested, not
+yet mechanically proven (development found and fixed 7 soundness bugs across 8
+review passes, and more in the front-end since). Read [SECURITY.md](SECURITY.md)
+before relying on a verdict, and [docs/ROADMAP.md](docs/ROADMAP.md) for the path
+from prototype to product.
 
 ## What it does
 
