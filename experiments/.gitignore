@@ -5,3 +5,5 @@ whorl-events.json
 e2e-work/
 lockbud-work/
 toys-work/
+fieldtrial/tracing-core/
+fieldtrial/shared-target/
