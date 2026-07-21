@@ -29,6 +29,12 @@ MOVE   = re.compile(r'^\s*(_\d+) = move (_\d+);')
 # Only names that are local functions count (checked against split_fns keys);
 # the held-set at the call site feeds the interprocedural entry-may fixpoint.
 CALL   = re.compile(r'_\d+ = (\w+)\((?:move|copy) ')
+# `_6 = <F as FnOnce<()>>::call_once(move _7, ...)` -- an indirect call on a
+# callable value. This probe cannot resolve which body runs, so if locks are
+# held here it must NOT claim SAFE: ordering edges are being lost. The typed
+# dylint front-end resolves these by binding closures to parameters; here we
+# only fail closed.
+INDIRECT = re.compile(r'= <.*? as (?:FnOnce|FnMut|Fn)<[^>]*>>::call(?:_once|_mut)?\(')
 FN     = re.compile(r'^fn (\w+)\(')
 BB     = re.compile(r'^\s*bb(\d+): \{')
 SUCC   = re.compile(r'bb(\d+)')
@@ -67,6 +73,8 @@ def parse_fn(lines, local_fns=frozenset()):
                 else:
                     m = MEMDROP.search(ln) or DROP.search(ln)
                     if m: blocks[cur]['eff'].append(('drop', m.group(1)))
+                    elif INDIRECT.search(ln):
+                        blocks[cur]['eff'].append(('indirect',))
                     else:
                         m = CALL.search(ln)
                         if m and m.group(1) in local_fns:
@@ -77,7 +85,7 @@ def parse_fn(lines, local_fns=frozenset()):
 
 def analyze_fn(name, lines, local_fns=frozenset()):
     blocks = parse_fn(lines, local_fns)
-    if not blocks: return [], []
+    if not blocks: return [], [], []
     preds = collections.defaultdict(list)
     for b, info in blocks.items():
         for s in info['succ']:
@@ -103,7 +111,7 @@ def analyze_fn(name, lines, local_fns=frozenset()):
             ins = frozenset() if (b == entry or not preds[b]) else frozenset().union(*[OUT[p] for p in preds[b]])
             o = transfer(b, ins)
             if ins != IN[b] or o != OUT[b]: IN[b] = ins; OUT[b] = o; changed = True
-    events, calls = [], []
+    events, calls, unresolved = [], [], []
     for b in sorted(blocks):
         st = set(IN[b])
         for e in blocks[b]['eff']:
@@ -117,16 +125,23 @@ def analyze_fn(name, lines, local_fns=frozenset()):
             elif e[0] == 'call':
                 held = sorted({gclass[g] for g in st if g in gclass})
                 calls.append((name, held, e[1]))
-    return events, calls
+            elif e[0] == 'indirect':
+                held = sorted({gclass[g] for g in st if g in gclass})
+                if held:
+                    unresolved.append((name, held))
+    return events, calls, unresolved
 
 def analyze_text(text):
+    """Return (events, incomplete_reason). A non-None reason means the event
+    list is missing edges and a SAFE verdict would not be conclusive."""
     fns = split_fns(text)
     local = frozenset(fns)
-    evs, calls = [], []
+    evs, calls, unresolved = [], [], []
     for name, lines in fns.items():
-        e, c = analyze_fn(name, lines, local)
+        e, c, u = analyze_fn(name, lines, local)
         evs += e
         calls += c
+        unresolved += u
     # Interprocedural entry-may fixpoint (same as the .whorl frontend): a guard
     # held at a call site is held throughout the callee, transitively.
     entry = collections.defaultdict(set)
@@ -138,7 +153,20 @@ def analyze_text(text):
             if not incoming <= entry[callee]:
                 entry[callee] |= incoming
                 changed = True
-    return [(fn, sorted(set(held) | entry[fn]), acq) for fn, held, acq in evs]
+    widened = [(fn, sorted(set(held) | entry[fn]), acq) for fn, held, acq in evs]
+    reason = None
+    if unresolved:
+        fn, held = unresolved[0]
+        reason = f"{fn} makes an indirect call while holding {held}; this probe cannot resolve the callee"
+    return widened, reason
+
+
+def analyze(text):
+    """Full pipeline: (label, detail). INCOMPLETE when edges were lost."""
+    events, incomplete = analyze_text(text)
+    if incomplete:
+        return ("INCOMPLETE", incomplete)
+    return verdict(events)
 
 def verdict(events):
     """Return (label, detail). Same Havender model as whorl::solver."""

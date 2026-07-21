@@ -63,7 +63,8 @@ def lockbud_verdict(case_path, name):
 def main():
     os.makedirs(WORK, exist_ok=True)
     sys.path.insert(0, os.path.join(HERE, "..", "mir-poc"))
-    import whorl_mir
+    sys.path.insert(0, HERE)
+    from run_dylint import dylint_verdict  # the real pipeline, not the probe
 
     cases = sorted(glob.glob(os.path.join(HERE, "cases", "*.rs")))
     rows, lb_fn, lb_fp, whorl_fn = [], 0, 0, 0
@@ -72,18 +73,9 @@ def main():
         src = open(path).read()
         m = re.search(r"//\s*EXPECT:\s*(SAFE|DEADLOCK)", src)
         expect = m.group(1) if m else "?"
-        # whorl column: the stable-MIR PoC verdict, which run_dylint.py shows is
-        # identical to the full dylint pipeline on this corpus (0 divergences).
-        mir = os.path.join(WORK, name + ".mir")
-        subprocess.run(
-            ["rustc", "--emit=mir", "--crate-type=lib", path, "-o", mir],
-            capture_output=True,
-        )
-        whorl = (
-            whorl_mir.verdict(whorl_mir.analyze_text(open(mir).read()))[0]
-            if os.path.exists(mir)
-            else "ERR"
-        )
+        # whorl column: the REAL pipeline (dylint front-end -> solver), so this
+        # is a tool-vs-tool comparison rather than probe-vs-tool.
+        whorl = dylint_verdict(path, name)
         lb, errnote = lockbud_verdict(path, name)
         if expect == "DEADLOCK" and whorl == "SAFE":
             whorl_fn += 1

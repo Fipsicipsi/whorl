@@ -100,57 +100,115 @@ pub fn parse(src: &str) -> Result<Program, String> {
     // negative. It therefore also emits call edges (caller, callee, held at the
     // call site); here we run the same monotone entry-may fixpoint as the
     // .whorl frontend and fold each function's entry-may set into its events.
+    let mut edges: Vec<(String, String, Vec<String>)> = Vec::new();
     if let Some(Value::Arr(calls)) = top.get("calls") {
-        let mut edges = Vec::new();
         for (idx, c) in calls.iter().enumerate() {
             let Value::Obj(c) = c else {
                 return Err(format!("calls[{idx}] is not an object"));
             };
-            let held = match c.get("held") {
-                Some(Value::Arr(hs)) => {
-                    let mut held = Vec::new();
-                    for h in hs {
-                        match h {
-                            Value::Str(s) => held.push(s.clone()),
-                            _ => return Err(format!("calls[{idx}].held contains a non-string")),
-                        }
-                    }
-                    held
-                }
-                _ => return Err(format!("calls[{idx}] is missing \"held\"")),
-            };
             edges.push((
                 str_field(c, "function", idx)?,
                 str_field(c, "callee", idx)?,
-                held,
+                held_field(c, "calls", idx)?,
             ));
         }
-        let mut entry_may: HashMap<String, Vec<String>> = HashMap::new();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (caller, callee, held) in &edges {
-                let mut incoming = held.clone();
-                if let Some(from_caller) = entry_may.get(caller) {
-                    incoming.extend(from_caller.iter().cloned());
-                }
-                let into = entry_may.entry(callee.clone()).or_default();
-                for c in incoming {
-                    if !into.contains(&c) {
-                        into.push(c);
-                        changed = true;
+    }
+
+    // Indirect calls. A function may invoke a callable it received
+    // (`param_calls`); which body that runs is decided by whoever passed it in
+    // (`closure_args`). Joining the two resolves the call. An unresolved
+    // indirect call made while holding locks loses ordering edges, so it must
+    // force [INCOMPLETE] rather than a wrong [SAFE].
+    let mut param_calls: Vec<(String, usize, Vec<String>)> = Vec::new();
+    if let Some(Value::Arr(pcs)) = top.get("param_calls") {
+        for (idx, c) in pcs.iter().enumerate() {
+            let Value::Obj(c) = c else {
+                return Err(format!("param_calls[{idx}] is not an object"));
+            };
+            param_calls.push((
+                str_field(c, "function", idx)?,
+                num_field(c, "param", idx)?,
+                held_field(c, "param_calls", idx)?,
+            ));
+        }
+    }
+    let mut closure_args: Vec<(String, usize, String)> = Vec::new();
+    if let Some(Value::Arr(cas)) = top.get("closure_args") {
+        for (idx, c) in cas.iter().enumerate() {
+            let Value::Obj(c) = c else {
+                return Err(format!("closure_args[{idx}] is not an object"));
+            };
+            closure_args.push((
+                str_field(c, "callee", idx)?,
+                num_field(c, "param", idx)?,
+                str_field(c, "closure", idx)?,
+            ));
+        }
+    }
+
+    let mut entry_may: HashMap<String, Vec<String>> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (caller, callee, held) in &edges {
+            let mut incoming = held.clone();
+            if let Some(from_caller) = entry_may.get(caller) {
+                incoming.extend(from_caller.iter().cloned());
+            }
+            changed |= merge(&mut entry_may, callee, incoming);
+        }
+        // resolve `g` calling its parameter #i to every closure passed there.
+        for (g, i, held_at_call) in &param_calls {
+            for (callee, param, closure) in &closure_args {
+                if callee == g && param == i {
+                    let mut incoming = held_at_call.clone();
+                    if let Some(from_g) = entry_may.get(g) {
+                        incoming.extend(from_g.iter().cloned());
                     }
+                    changed |= merge(&mut entry_may, closure, incoming);
                 }
             }
         }
-        for e in &mut events {
-            if let Some(extra) = entry_may.get(&e.function) {
-                for c in extra {
-                    if !e.held.contains(c) {
-                        e.held.push(c.clone());
-                        class_instances.entry(c.clone()).or_insert(2);
-                    }
+    }
+    for e in &mut events {
+        if let Some(extra) = entry_may.get(&e.function) {
+            for c in extra {
+                if !e.held.contains(c) {
+                    e.held.push(c.clone());
+                    class_instances.entry(c.clone()).or_insert(2);
                 }
+            }
+        }
+    }
+
+    // Fail closed: an indirect call under a held lock whose callee we could not
+    // resolve, or an outright opaque call (fn pointer, trait object), means the
+    // event list is missing edges. A deadlock found anyway is still real; the
+    // ABSENCE of one is not conclusive.
+    let mut unresolved: Option<String> = None;
+    for (g, i, held_at_call) in &param_calls {
+        if held_at_call.is_empty() {
+            continue;
+        }
+        let resolved = closure_args
+            .iter()
+            .any(|(callee, p, _)| callee == g && p == i);
+        if !resolved {
+            unresolved = Some(format!(
+                "{g} calls its parameter #{i} while holding {held_at_call:?},                  and no callable passed there could be resolved"
+            ));
+            break;
+        }
+    }
+    if unresolved.is_none() {
+        if let Some(Value::Arr(ocs)) = top.get("opaque_calls") {
+            if let Some(Value::Obj(c)) = ocs.first() {
+                let f = str_field(c, "function", 0)?;
+                let s = str_field(c, "site", 0)?;
+                let held = held_field(c, "opaque_calls", 0)?;
+                unresolved = Some(format!(
+                    "unresolved indirect call (fn pointer or trait object) at                      {s} in {f} while holding {held:?}"
+                ));
             }
         }
     }
@@ -168,7 +226,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
 
     let incomplete = match top.get("incomplete") {
         Some(Value::Str(r)) => Some(r.clone()),
-        _ => None,
+        _ => unresolved,
     };
 
     Ok(Program {
@@ -177,6 +235,46 @@ pub fn parse(src: &str) -> Result<Program, String> {
         class_instances,
         incomplete,
     })
+}
+
+/// Union `incoming` into `entry_may[target]`; true if anything was added.
+fn merge(
+    entry_may: &mut HashMap<String, Vec<String>>,
+    target: &str,
+    incoming: Vec<String>,
+) -> bool {
+    let into = entry_may.entry(target.to_string()).or_default();
+    let mut changed = false;
+    for c in incoming {
+        if !into.contains(&c) {
+            into.push(c);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn held_field(obj: &HashMap<String, Value>, what: &str, idx: usize) -> Result<Vec<String>, String> {
+    match obj.get("held") {
+        Some(Value::Arr(hs)) => {
+            let mut held = Vec::new();
+            for h in hs {
+                match h {
+                    Value::Str(s) => held.push(s.clone()),
+                    _ => return Err(format!("{what}[{idx}].held contains a non-string")),
+                }
+            }
+            Ok(held)
+        }
+        _ => Err(format!("{what}[{idx}] is missing \"held\"")),
+    }
+}
+
+fn num_field(obj: &HashMap<String, Value>, key: &str, idx: usize) -> Result<usize, String> {
+    match obj.get(key) {
+        Some(Value::Num(n)) => Ok(*n),
+        _ => Err(format!("entry[{idx}] is missing number field \"{key}\"")),
+    }
 }
 
 fn str_field(obj: &HashMap<String, Value>, key: &str, idx: usize) -> Result<String, String> {
@@ -460,6 +558,69 @@ mod tests {
         let prog = parse(src).unwrap();
         let c_event = prog.events.iter().find(|e| e.function == "c").unwrap();
         assert!(c_event.held.contains(&"L".to_string()));
+    }
+
+    #[test]
+    fn closure_passed_to_a_callback_taker_is_resolved() {
+        // with_a holds A and calls its parameter #2; path1 passes a closure that
+        // locks B. Joining the two gives A < B, which closes a cycle with
+        // path2's B < A. Without the join this reads SAFE (a false negative).
+        let src = r#"{
+  "events": [
+    { "function": "with_a",             "site": "s:1", "acquires": "A", "held": [] },
+    { "function": "path1::{closure#0}", "site": "s:2", "acquires": "B", "held": [] },
+    { "function": "path2",              "site": "s:3", "acquires": "B", "held": [] },
+    { "function": "path2",              "site": "s:4", "acquires": "A", "held": ["B"] }
+  ],
+  "param_calls":  [ { "function": "with_a", "param": 2, "held": ["A"] } ],
+  "closure_args": [ { "function": "path1", "callee": "with_a", "param": 2,
+                      "closure": "path1::{closure#0}" } ]
+}"#;
+        let prog = parse(src).unwrap();
+        let in_closure = prog
+            .events
+            .iter()
+            .find(|e| e.function == "path1::{closure#0}")
+            .unwrap();
+        assert!(in_closure.held.contains(&"A".to_string()));
+        assert!(prog.incomplete.is_none(), "the call was resolved");
+        assert!(matches!(analyze(&prog).outcome, Outcome::Deadlock { .. }));
+    }
+
+    #[test]
+    fn unresolved_callback_under_a_held_lock_forces_incomplete() {
+        // Nobody passes a callable to g's parameter, so the body it runs is
+        // unknown. Edges are lost, so SAFE must not be claimed.
+        let src = r#"{
+  "events": [ { "function": "g", "site": "s:1", "acquires": "L", "held": [] } ],
+  "param_calls": [ { "function": "g", "param": 1, "held": ["L"] } ]
+}"#;
+        let prog = parse(src).unwrap();
+        assert!(prog.incomplete.is_some());
+    }
+
+    #[test]
+    fn opaque_indirect_call_forces_incomplete() {
+        let src = r#"{
+  "events": [],
+  "opaque_calls": [ { "function": "f", "site": "a.rs:9", "held": ["L"] } ]
+}"#;
+        let prog = parse(src).unwrap();
+        let reason = prog.incomplete.expect("must be incomplete");
+        assert!(reason.contains("a.rs:9"));
+    }
+
+    #[test]
+    fn callback_with_nothing_held_does_not_force_incomplete() {
+        // No lock is held at the indirect call, so no ordering edge is lost:
+        // the callee's own internal ordering is captured when its body is
+        // analyzed on its own.
+        let src = r#"{
+  "events": [ { "function": "g", "site": "s:1", "acquires": "L", "held": [] } ],
+  "param_calls": [ { "function": "g", "param": 1, "held": [] } ]
+}"#;
+        let prog = parse(src).unwrap();
+        assert!(prog.incomplete.is_none());
     }
 
     #[test]

@@ -25,10 +25,11 @@ for path in cases:
     subprocess.run(["rustc", "--emit=mir", "--crate-type=lib", path, "-o", mir],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.path.exists(mir):
-        label, _ = whorl_mir.verdict(whorl_mir.analyze_text(open(mir).read()))
+        label, _ = whorl_mir.analyze(open(mir).read())
     else:
         label = "ERR"
-    if expect == "DEADLOCK" and label == "SAFE": status = "FALSE-NEG (UNSOUND)"; false_neg += 1
+    if label == "INCOMPLETE": status = "incomplete (fail-closed)"
+    elif expect == "DEADLOCK" and label == "SAFE": status = "FALSE-NEG (UNSOUND)"; false_neg += 1
     elif expect == "SAFE" and label == "DEADLOCK": status = "false-pos"; false_pos += 1
     elif expect == label: status = "ok"
     else: status = "MISMATCH"

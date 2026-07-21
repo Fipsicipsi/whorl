@@ -33,12 +33,15 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 13 cases, 12/13 match, 0 false negatives, 1 false
-positive. The 13th case (`cross_call_deadlock.rs`) was added as a deliberate
-red test: it proved both implementations had an interprocedural false negative
+Current status on this corpus: 14 cases, 13/14 match, 0 false negatives, 1 false
+positive. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
 (a guard held across a call was invisible in the callee), which was then fixed
 by call-edge tracking plus an entry-may fixpoint -- in the lint/solver pipeline
-and in the PoC alike. The false positive is `outer_lock_serializes.rs`, the classic Havender
+and in the PoC alike. `closure_call_deadlock.rs` is the same story one level
+deeper: the ordering edge exists only inside a closure invoked through a
+callback parameter, which both implementations missed. The dylint front-end now
+resolves it by binding closures to the parameters they are passed to; the
+text PoC cannot, so it fails closed with `[INCOMPLETE]` instead of a wrong SAFE. The false positive is `outer_lock_serializes.rs`, the classic Havender
 case (two same-class locks only ever taken under a common outer lock, so the
 inversion cannot happen concurrently). It is deliberate: the strict class
 partial order rejects the program, and the honest answer is an explicit escape
@@ -53,9 +56,12 @@ ownership, so the held-set follows the value, and `mem::drop` kills it.
 `whorl --events`) on every case and cross-checks it against both the ground
 truth and the stable-MIR PoC. Two independent implementations of the same
 analysis on the same corpus is a differential test in itself: any disagreement
-is a bug in one of them. Current status: 12/13 match ground truth, 0 false
+is a bug in one of them. Current status: 13/14 match ground truth, 0 false
 negatives, 0 divergences between the two implementations; the single miss is
-the same deliberate Havender false positive in both.
+the same deliberate Havender false positive in both. Where the PoC fails closed
+(`[INCOMPLETE]`) and the lint resolves the case, that is recorded as
+`ok (poc fail-closed)`, not a divergence -- one implementation being more
+capable is fine, one being wrong is not.
 
 ## The `lockbud` head-to-head (`run_lockbud.py`) -- Direction 2, run
 
@@ -64,11 +70,15 @@ detector and an unsound bug-finder by design. `run_lockbud.py` runs it on every
 case next to the Whorl verdict. Result on this corpus:
 
 ```
-whorl false negatives: 0   | lockbud false negatives: 2 | lockbud false positives: 1
+whorl false negatives: 0   | lockbud false negatives: 3 | lockbud false positives: 1
 ```
 
+The whorl column is the real pipeline (dylint front-end into the solver), not
+the text probe, so this is tool against tool.
+
 Lockbud misses `two_account_deadlock.rs` -- the canonical textbook deadlock --
-and `branch_deadlock.rs`. Both misses are the same systematic blind spot: its
+plus `branch_deadlock.rs` and `closure_call_deadlock.rs`. Two of the three are
+the same systematic blind spot: its
 DoubleLock detector needs the SAME lock twice and its ConflictLock detector
 needs an inverted order between two DISTINCT named locks, so an unordered
 acquisition of two instances of the same lock class falls through both. That
@@ -137,7 +147,7 @@ crates.io on first run.
 
 ## Caveats
 
-This corpus is tiny. Thirteen labeled cases beat zero, and the head-to-head
+This corpus is tiny. Fourteen labeled cases beat zero, and the head-to-head
 result is real, but it cannot carry a general soundness claim. Growing it --
 the published Lockbud/Archerfish real-world bugs, real driver/HAL-shaped SAFE
 code, locks behind closures and trait objects (the known remaining blind spot

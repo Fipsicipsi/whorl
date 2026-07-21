@@ -73,12 +73,12 @@ The soundness claim is the whole value, and the literature shows soundness claim
 are routinely false in practice. So the repository ships the checks, not just the
 claim. All of these are reproducible under `experiments/`.
 
-**1. Head to head against Lockbud.** On a 13-case labeled corpus, run next to
-Lockbud, the established static Rust deadlock detector:
+**1. Head to head against Lockbud.** On a 14-case labeled corpus, both tools run
+end to end, next to Lockbud, the established static Rust deadlock detector:
 
 ```
 whorl   false negatives: 0
-lockbud false negatives: 2   (including the canonical two-account transfer deadlock)
+lockbud false negatives: 3   (including the canonical two-account transfer deadlock)
 ```
 
 Lockbud's DoubleLock detector needs the same lock twice; its ConflictLock
@@ -113,14 +113,15 @@ treating interrupt masking as a resource in the same order graph as the locks.
 
 ## Honest limits
 
-- The corpus is 13 hand-labeled cases plus Lockbud's toys. That is evidence, not
+- The corpus is 14 hand-labeled cases plus Lockbud's toys. That is evidence, not
   a proof. A general soundness claim needs scale and, ideally, a mechanized core.
 - Soundness is argued and tested, not mechanically verified. Development found
   and fixed seven real soundness bugs across the review passes; there may be more.
-- Interprocedural held-sets follow direct calls to named functions. Locks behind
-  closures, function pointers, and trait objects are not yet tracked -- a shared
-  blind spot with the field, and a source of potential false negatives being
-  closed deliberately.
+- Interprocedural held-sets follow direct calls, and callbacks are resolved by
+  binding a closure to the parameter it is passed to (so a lock held across an
+  invoked callback is seen). What is still unresolved -- calls through function
+  pointers and trait objects -- does not silently pass: an unresolved indirect
+  call made while a lock is held forces `[INCOMPLETE]` rather than `[SAFE]`.
 - The class abstraction merges instances a points-to analysis would separate, so
   two distinct same-type locals locked in a consistent order read as a false
   positive. That is the Havender trade: soundness over precision.

@@ -72,7 +72,7 @@ def poc_verdict(case_path, name):
     )
     if not os.path.exists(mir):
         return "ERR"
-    label, _ = whorl_mir.verdict(whorl_mir.analyze_text(open(mir).read()))
+    label, _ = whorl_mir.analyze(open(mir).read())
     return label
 
 
@@ -89,7 +89,9 @@ def main():
         expect = m.group(1) if m else "?"
         poc = poc_verdict(path, name)
         dy = dylint_verdict(path, name)
-        if expect == "DEADLOCK" and dy == "SAFE":
+        if poc == "INCOMPLETE" and dy == expect:
+            status = "ok (poc fail-closed)"
+        elif expect == "DEADLOCK" and dy == "SAFE":
             status = "FALSE-NEG (UNSOUND)"
             fn_dylint += 1
         elif expect == "SAFE" and dy == "DEADLOCK":
@@ -98,7 +100,7 @@ def main():
             status = "ok"
         else:
             status = "ERR"
-        if poc != dy and "ERR" not in (poc, dy):
+        if poc != dy and "ERR" not in (poc, dy) and poc != "INCOMPLETE":
             status += " DIVERGES-FROM-POC"
             disagree += 1
         rows.append((os.path.basename(path), expect, poc, dy, status))

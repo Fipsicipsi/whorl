@@ -28,6 +28,11 @@ acquisition (`std`/`parking_lot`/`spin` `Mutex::lock`, `RwLock::read/write`, and
   (held) at that acquire, computed by a gen/kill liveness pass over the guard
   locals (gen at `Store`/`Call`, kill at `Drop`/`Move`/`StorageDead`).
 
+It also emits the interprocedural facts the solver needs: call edges, plus
+`param_calls`/`closure_args` so an indirect call on a callback parameter can be
+bound to the closures actually passed there, and `opaque_calls` for indirect
+calls it cannot resolve at all (which force `[INCOMPLETE]`).
+
 These events are written as JSON (a `whorl::model::Program`) to the path in
 `$WHORL_EVENTS_OUT` (default `./whorl-events.json`). The **existing**
 `whorl::solver::analyze` (Havender cycle check over the inferred lock-class

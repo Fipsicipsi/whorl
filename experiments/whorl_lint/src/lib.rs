@@ -78,10 +78,37 @@ struct CallEdge {
     callee: String,
     held: BTreeSet<String>,
 }
+/// `function` invokes its own parameter #`param` (an indirect call on a
+/// callable it received) while holding `held`. Which body that runs is decided
+/// by whoever passed the callable in -- see `ClosureArg`.
+struct ParamCall {
+    function: String,
+    param: usize,
+    held: BTreeSet<String>,
+}
+/// `function` passes `closure` as argument #`param` to `callee`. Joined with a
+/// matching `ParamCall` on the stable side, this resolves the indirect call.
+struct ClosureArg {
+    function: String,
+    callee: String,
+    param: usize,
+    closure: String,
+}
+/// An indirect call whose callee cannot be resolved at all (fn pointer, trait
+/// object) made while holding locks. Ordering edges are lost here, so the
+/// analysis must not claim SAFE: this forces `[INCOMPLETE]`.
+struct OpaqueCall {
+    function: String,
+    site: String,
+    held: BTreeSet<String>,
+}
 #[derive(Default)]
 struct ProgramOut {
     events: Vec<Event>,
     calls: Vec<CallEdge>,
+    param_calls: Vec<ParamCall>,
+    closure_args: Vec<ClosureArg>,
+    opaque_calls: Vec<OpaqueCall>,
     // class symbol -> set of distinct receiver-base identities seen for it.
     // len() >= 2 => the class has >=2 instances (cross-instance inversion is
     // possible); len() == 1 => single-instance (reentrancy). Feeds
@@ -223,6 +250,45 @@ fn is_result_unwrap<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
     p.ends_with("Result::unwrap") || p.ends_with("Result::expect")
 }
 
+/// True if `did` is one of the `Fn`/`FnMut`/`FnOnce` call shims, i.e. an
+/// indirect call on a callable value rather than a statically known function.
+fn is_fn_call_shim<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+    let p = strip_generics(&tcx.def_path_str(did));
+    p.ends_with("FnOnce::call_once") || p.ends_with("FnMut::call_mut") || p.ends_with("Fn::call")
+}
+
+/// Trace `local` back through `_a = move/copy _b` chains to a parameter of this
+/// body, returning its 1-based index. Used to see that an indirect call is on a
+/// callable the function received as an argument.
+fn resolve_to_param<'tcx>(body: &Body<'tcx>, mut local: Local) -> Option<usize> {
+    for _ in 0..8 {
+        let idx = local.as_usize();
+        if idx >= 1 && idx <= body.arg_count {
+            return Some(idx);
+        }
+        let mut src: Option<Local> = None;
+        for data in body.basic_blocks.iter() {
+            for stmt in &data.statements {
+                if let StatementKind::Assign(boxed) = &stmt.kind {
+                    let (dest, rvalue) = &**boxed;
+                    if dest.local == local && dest.projection.is_empty() {
+                        if let Rvalue::Use(op) = rvalue {
+                            if let Some(p) = op.place() {
+                                if src.is_some() {
+                                    return None; // multiple defs: give up
+                                }
+                                src = Some(p.local);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        local = src?;
+    }
+    None
+}
+
 /// The single global critical-section resource (interrupts disabled). Every
 /// `critical_section::Mutex` / `cortex_m::interrupt::Mutex` is guarded by THIS
 /// one lock, so it is one reentrant class, not one class per Mutex. Entering it
@@ -290,6 +356,12 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     // Entering masks interrupts (an acquire of CS_CLASS); the closure body runs
     // with CS held, so the critical section flows into it as a call edge.
     let mut cs_enters: Vec<(Location, String)> = Vec::new();
+    // indirect call on our own parameter #n (a callable we received).
+    let mut param_calls: Vec<(Location, usize)> = Vec::new();
+    // (callee path, param index, closure path): a callable we pass on.
+    let mut closure_args: Vec<(String, usize, String)> = Vec::new();
+    // indirect calls we cannot resolve at all.
+    let mut opaque_calls: Vec<Location> = Vec::new();
 
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // VERIFY: body.basic_blocks is a FIELD on this nightly (was a method).
@@ -297,7 +369,12 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
         // Match with `..`: Call now also has call_source/target/unwind/fn_span.
         if let TerminatorKind::Call { func, args, destination, .. } = &term.kind {
             // const_fn_def() -> Option<(DefId, GenericArgsRef)>. (verified)
-            let Some((callee, _generics)) = func.const_fn_def() else { continue };
+            let Some((callee, _generics)) = func.const_fn_def() else {
+                // A call through a value: fn pointer or trait object. We cannot
+                // see the body, so any ordering it establishes is invisible.
+                opaque_calls.push(Location { block: bb, statement_index: data.statements.len() });
+                continue;
+            };
             if std::env::var("WHORL_DEBUG").is_ok() {
                 eprintln!("whorl-debug: call {} in {}", tcx.def_path_str(callee), function);
             }
@@ -315,6 +392,25 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 }
                 continue;
             }
+            if is_fn_call_shim(tcx, callee) {
+                let loc = Location { block: bb, statement_index: data.statements.len() };
+                let callable = args.first().map(|a| &a.node);
+                if let Some(path) = callable.and_then(|op| callee_body_path(tcx, body, op)) {
+                    // the callable is a concrete closure/fn: a normal call edge.
+                    local_calls.push((loc, path));
+                } else if let Some(p) = callable
+                    .and_then(|op| op.place())
+                    .and_then(|pl| resolve_to_param(body, pl.local))
+                {
+                    // an indirect call on a parameter: whoever passed the
+                    // callable in decides which body runs (resolved on the
+                    // stable side by joining with ClosureArg).
+                    param_calls.push((loc, p));
+                } else {
+                    opaque_calls.push(loc);
+                }
+                continue;
+            }
             if is_critical_section_enter(tcx, callee) {
                 // The masked region is the closure argument. Record it so the
                 // critical section can be flowed into that body below.
@@ -325,8 +421,15 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 continue;
             }
             if !is_lock_acquire(tcx, callee) {
+                let loc = Location { block: bb, statement_index: data.statements.len() };
+                // Note every callable we hand to this callee, so an indirect
+                // call on the matching parameter can be resolved to it.
+                for (i, a) in args.iter().enumerate() {
+                    if let Some(cl) = callee_body_path(tcx, body, &a.node) {
+                        closure_args.push((tcx.def_path_str(callee), i + 1, cl));
+                    }
+                }
                 if callee.is_local() {
-                    let loc = Location { block: bb, statement_index: data.statements.len() };
                     local_calls.push((loc, tcx.def_path_str(callee)));
                 }
                 continue;
@@ -414,6 +517,43 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
             prog.calls.push(CallEdge {
                 function: function.clone(),
                 callee: callee.clone(),
+                held,
+            });
+        }
+        for (loc, param) in &param_calls {
+            let mut held: BTreeSet<String> = BTreeSet::new();
+            for gl in live.get(loc).cloned().unwrap_or_default() {
+                if let Some((cls, _)) = guard_class.get(&gl) {
+                    held.insert(cls.clone());
+                }
+            }
+            prog.param_calls.push(ParamCall {
+                function: function.clone(),
+                param: *param,
+                held,
+            });
+        }
+        for (callee, param, closure) in &closure_args {
+            prog.closure_args.push(ClosureArg {
+                function: function.clone(),
+                callee: callee.clone(),
+                param: *param,
+                closure: closure.clone(),
+            });
+        }
+        for loc in &opaque_calls {
+            let mut held: BTreeSet<String> = BTreeSet::new();
+            for gl in live.get(loc).cloned().unwrap_or_default() {
+                if let Some((cls, _)) = guard_class.get(&gl) {
+                    held.insert(cls.clone());
+                }
+            }
+            if held.is_empty() {
+                continue; // nothing held: no ordering edge can be lost here
+            }
+            prog.opaque_calls.push(OpaqueCall {
+                function: function.clone(),
+                site: span_to_site(tcx, body, *loc),
                 held,
             });
         }
@@ -732,6 +872,51 @@ fn write_events<'tcx>(_tcx: TyCtxt<'tcx>) {
                 jstr(&c.callee),
                 held.join(", "),
                 if i + 1 == prog.calls.len() { "" } else { "," }
+            );
+        }
+        out.push_str("  ],
+  \"param_calls\": [
+");
+        for (i, c) in prog.param_calls.iter().enumerate() {
+            let held: Vec<String> = c.held.iter().map(|h| jstr(h)).collect();
+            let _ = write!(
+                out,
+                "    {{ \"function\": {}, \"param\": {}, \"held\": [{}] }}{}
+",
+                jstr(&c.function),
+                c.param,
+                held.join(", "),
+                if i + 1 == prog.param_calls.len() { "" } else { "," }
+            );
+        }
+        out.push_str("  ],
+  \"closure_args\": [
+");
+        for (i, c) in prog.closure_args.iter().enumerate() {
+            let _ = write!(
+                out,
+                "    {{ \"function\": {}, \"callee\": {}, \"param\": {}, \"closure\": {} }}{}
+",
+                jstr(&c.function),
+                jstr(&c.callee),
+                c.param,
+                jstr(&c.closure),
+                if i + 1 == prog.closure_args.len() { "" } else { "," }
+            );
+        }
+        out.push_str("  ],
+  \"opaque_calls\": [
+");
+        for (i, c) in prog.opaque_calls.iter().enumerate() {
+            let held: Vec<String> = c.held.iter().map(|h| jstr(h)).collect();
+            let _ = write!(
+                out,
+                "    {{ \"function\": {}, \"site\": {}, \"held\": [{}] }}{}
+",
+                jstr(&c.function),
+                jstr(&c.site),
+                held.join(", "),
+                if i + 1 == prog.opaque_calls.len() { "" } else { "," }
             );
         }
         out.push_str("  ]");
