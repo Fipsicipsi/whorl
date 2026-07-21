@@ -53,6 +53,8 @@ def verdict(case_path, name):
     v = subprocess.run([WHORL, "--events", events], capture_output=True, text=True)
     if "[DEADLOCK]" in v.stdout:
         return "DEADLOCK", ""
+    if "[INCOMPLETE]" in v.stdout:
+        return "INCOMPLETE", ""
     if "[SAFE]" in v.stdout:
         return "SAFE", ""
     return "ERR", "no verdict"
@@ -68,7 +70,9 @@ def main():
         m = re.search(r"//\s*EXPECT:\s*(SAFE|DEADLOCK)", src)
         expect = m.group(1) if m else "?"
         got, _ = verdict(path, os.path.splitext(os.path.basename(path))[0])
-        if expect == "DEADLOCK" and got == "SAFE":
+        if got == "INCOMPLETE":
+            status = "incomplete (fail-closed)"
+        elif expect == "DEADLOCK" and got == "SAFE":
             status = "FALSE-NEG (UNSOUND)"
             fn += 1
         elif got == expect:

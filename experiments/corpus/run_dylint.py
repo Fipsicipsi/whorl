@@ -59,6 +59,8 @@ def dylint_verdict(case_path, name):
     v = subprocess.run([WHORL, "--events", events], capture_output=True, text=True)
     if "[DEADLOCK]" in v.stdout:
         return "DEADLOCK"
+    if "[INCOMPLETE]" in v.stdout:
+        return "INCOMPLETE"
     if "[SAFE]" in v.stdout:
         return "SAFE"
     return "ERR(verdict)"
@@ -89,7 +91,9 @@ def main():
         expect = m.group(1) if m else "?"
         poc = poc_verdict(path, name)
         dy = dylint_verdict(path, name)
-        if poc == "INCOMPLETE" and dy == expect:
+        if dy == "INCOMPLETE":
+            status = "incomplete (fail-closed)"
+        elif poc == "INCOMPLETE" and dy == expect:
             status = "ok (poc fail-closed)"
         elif expect == "DEADLOCK" and dy == "SAFE":
             status = "FALSE-NEG (UNSOUND)"
@@ -100,7 +104,7 @@ def main():
             status = "ok"
         else:
             status = "ERR"
-        if poc != dy and "ERR" not in (poc, dy) and poc != "INCOMPLETE":
+        if poc != dy and "ERR" not in (poc, dy) and "INCOMPLETE" not in (poc, dy):
             status += " DIVERGES-FROM-POC"
             disagree += 1
         rows.append((os.path.basename(path), expect, poc, dy, status))

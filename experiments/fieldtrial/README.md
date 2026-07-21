@@ -26,16 +26,21 @@ whorl --events events.json
 - **Two lock classes** were found and named from real types:
   `std::sync::Mutex<Vec<&dyn Callsite>>` (the callsite registry) and
   `std::sync::RwLock<Vec<Registrar>>` (the dispatcher registry).
-- **Verdict: `[SAFE]`**, 0 ordering constraints. The two locks are never held at
-  the same time, so no ordering edge exists and the graph is trivially acyclic.
-  That matches reality: tracing-core is not known to have a lock-ordering
-  deadlock. A clean crate reads clean.
+- **Verdict: originally `[SAFE]`, now `[INCOMPLETE]`.** No ordering edge is
+  found (the two locks are never held together), but a later adversarial review
+  proved the `[SAFE]` was not justified: tracing-core reaches a lock through an
+  accessor returning a reference, and the class derivation gave that route a
+  different class symbol than the field route would. Splitting one physical lock
+  into two class names is unsound -- the two nodes can never close a cycle -- so
+  an un-canonicalizable receiver now forces `[INCOMPLETE]`. The honest reading:
+  Whorl still finds no deadlock here, but it no longer claims to have proved
+  there is none.
 
 Only four acquisition sites turned up in a big crate because tracing-core is
 deliberately lock-light and because its own spin-mutex (`src/spin/mutex.rs`) is
 compiled only in `no_std` builds; the default `std` build uses the two
 `std::sync` locks. The value here is robustness, not a bug hunt: the lint runs
-on real code without crashing and produces well-typed, correct output.
+on real code without crashing, and it now says exactly as much as it can justify.
 
 ## The honest finding: the target domain needs a different matcher
 

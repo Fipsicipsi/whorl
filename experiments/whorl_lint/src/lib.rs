@@ -123,6 +123,18 @@ thread_local! {
     static PROGRAM: RefCell<ProgramOut> = RefCell::new(ProgramOut::default());
 }
 
+/// Record that the event list is missing information. A deadlock found anyway
+/// is still real, but the ABSENCE of one stops being conclusive. First reason
+/// wins; it is a verdict qualifier, not a diagnostic list.
+fn mark_incomplete(reason: String) {
+    PROGRAM.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.incomplete.is_none() {
+            p.incomplete = Some(reason);
+        }
+    });
+}
+
 impl<'tcx> LateLintPass<'tcx> for WhorlLockOrder {
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
         let tcx = cx.tcx;
@@ -250,6 +262,68 @@ fn is_result_unwrap<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
     p.ends_with("Result::unwrap") || p.ends_with("Result::expect")
 }
 
+/// True if a type is something that can be called: a generic parameter (which
+/// may carry an Fn bound), a function pointer, or a trait object.
+fn is_callable_shaped<'tcx>(ty: ty::Ty<'tcx>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Param(_) | ty::TyKind::FnPtr(..) | ty::TyKind::Dynamic(..)
+    )
+}
+
+/// True if `local` is defined by a Call terminator, i.e. it holds a value
+/// returned by a function. The receiver resolution can only see through
+/// borrows, so a lock reached this way has no canonical field path.
+fn is_call_destination<'tcx>(body: &Body<'tcx>, local: Local) -> bool {
+    body.basic_blocks.iter().any(|data| {
+        matches!(
+            &data.terminator().kind,
+            TerminatorKind::Call { destination, .. }
+                if destination.local == local && destination.projection.is_empty()
+        )
+    })
+}
+
+/// The chain of locals a value was moved through: `local` plus everything it
+/// was moved OUT of. `mem::drop(g)` lowers to `_tmp = move _g; drop(_tmp)`, so
+/// releasing only the temp would leave the real guard live forever.
+fn move_chain<'tcx>(body: &Body<'tcx>, start: Local) -> Vec<Local> {
+    let mut chain = vec![start];
+    let mut cur = start;
+    for _ in 0..8 {
+        let mut src: Option<Local> = None;
+        for data in body.basic_blocks.iter() {
+            for stmt in &data.statements {
+                if let StatementKind::Assign(boxed) = &stmt.kind {
+                    let (dest, rvalue) = &**boxed;
+                    if dest.local == cur && dest.projection.is_empty() {
+                        if let Rvalue::Use(Operand::Move(p)) = rvalue {
+                            if src.is_some() {
+                                return chain; // several sources: stop, stay safe
+                            }
+                            src = Some(p.local);
+                        }
+                    }
+                }
+            }
+        }
+        match src {
+            Some(s) => {
+                chain.push(s);
+                cur = s;
+            }
+            None => break,
+        }
+    }
+    chain
+}
+
+/// True if `did` is `mem::drop`, which genuinely releases its argument.
+fn is_mem_drop<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+    let p = strip_generics(&tcx.def_path_str(did));
+    p == "std::mem::drop" || p == "core::mem::drop" || p.ends_with("mem::drop")
+}
+
 /// True if `did` is one of the `Fn`/`FnMut`/`FnOnce` call shims, i.e. an
 /// indirect call on a callable value rather than a statically known function.
 fn is_fn_call_shim<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
@@ -362,6 +436,9 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
     let mut closure_args: Vec<(String, usize, String)> = Vec::new();
     // indirect calls we cannot resolve at all.
     let mut opaque_calls: Vec<Location> = Vec::new();
+    // `mem::drop(g)` really does release; the generic Move kill no longer covers
+    // it, so record these explicitly.
+    let mut explicit_drops: Vec<(Location, Local)> = Vec::new();
 
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // VERIFY: body.basic_blocks is a FIELD on this nightly (was a method).
@@ -392,6 +469,17 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 }
                 continue;
             }
+            if is_mem_drop(tcx, callee) {
+                let loc = Location { block: bb, statement_index: data.statements.len() };
+                for a in args.iter() {
+                    if let Some(p) = a.node.place() {
+                        for l in move_chain(body, p.local) {
+                            explicit_drops.push((loc, l));
+                        }
+                    }
+                }
+                continue;
+            }
             if is_fn_call_shim(tcx, callee) {
                 let loc = Location { block: bb, statement_index: data.statements.len() };
                 let callable = args.first().map(|a| &a.node);
@@ -414,9 +502,13 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
             if is_critical_section_enter(tcx, callee) {
                 // The masked region is the closure argument. Record it so the
                 // critical section can be flowed into that body below.
-                if let Some(closure) = args.first().and_then(|a| callee_body_path(tcx, body, &a.node)) {
-                    let loc = Location { block: bb, statement_index: data.statements.len() };
-                    cs_enters.push((loc, closure));
+                let loc = Location { block: bb, statement_index: data.statements.len() };
+                match args.first().and_then(|a| callee_body_path(tcx, body, &a.node)) {
+                    Some(closure) => cs_enters.push((loc, closure)),
+                    // Generic wrapper, boxed closure or fn pointer: we cannot see
+                    // which body runs masked, so every lock it takes loses its
+                    // `critical-section < lock` edge. Fail closed.
+                    None => opaque_calls.push(loc),
                 }
                 continue;
             }
@@ -425,12 +517,33 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                 // Note every callable we hand to this callee, so an indirect
                 // call on the matching parameter can be resolved to it.
                 for (i, a) in args.iter().enumerate() {
-                    if let Some(cl) = callee_body_path(tcx, body, &a.node) {
-                        closure_args.push((tcx.def_path_str(callee), i + 1, cl));
+                    let ty = a.node.ty(&body.local_decls, tcx);
+                    match callee_body_path(tcx, body, &a.node) {
+                        Some(cl) => closure_args.push((tcx.def_path_str(callee), i + 1, cl)),
+                        // Callable-shaped but unnameable (a generic F forwarded on,
+                        // a fn pointer, a boxed dyn Fn). Record it as UNKNOWN so a
+                        // sibling call passing a real closure cannot make this
+                        // position look resolved.
+                        None if is_callable_shaped(ty) => closure_args.push((
+                            tcx.def_path_str(callee),
+                            i + 1,
+                            "<unknown>".to_string(),
+                        )),
+                        None => {}
                     }
                 }
                 if callee.is_local() {
-                    local_calls.push((loc, tcx.def_path_str(callee)));
+                    // A trait method call stays virtual in MIR; def_path_str gives
+                    // the TRAIT method path, which matches no analyzed body, so the
+                    // edge would be silently dead. Treat it as opaque instead.
+                    // A trait method's parent DefId is the trait itself; an
+                    // inherent method's parent is the impl. Generic and virtual
+                    // calls keep the TRAIT method here, unresolved to a body.
+                    if matches!(tcx.def_kind(tcx.parent(callee)), DefKind::Trait) {
+                        opaque_calls.push(loc);
+                    } else {
+                        local_calls.push((loc, tcx.def_path_str(callee)));
+                    }
                 }
                 continue;
             }
@@ -463,23 +576,76 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
             guard_class.insert(gl, (a.class.clone(), a.base_id.clone()));
         }
     }
-    // Any guard local we could not link gets a placeholder so it still appears
-    // in held-sets (sound: better to over-report a held lock than to drop it).
-    for (&gl, (kind, data)) in &guard_kind {
-        guard_class.entry(gl).or_insert_with(|| {
-            (format!("{kind}<{data}>@unlinked:{}", gl.as_u32()), format!("unlinked:{}", gl.as_u32()))
-        });
+    // A guard local we could not link to a lock class is a lock whose IDENTITY
+    // is unknown -- e.g. a guard returned from a helper. Fabricating a unique
+    // symbol for it (the old behaviour) is NOT conservative: a made-up name is a
+    // graph node nothing else mentions, so it can never close a cycle, and the
+    // real class it stands for is silently absent from every held-set that
+    // follows. Coarsening a class is sound; renaming one is not. An unknown held
+    // class could be ANY class, so the only sound treatments are to relate it to
+    // everything or to stop claiming a conclusive verdict. We do the latter.
+    // First let a class follow the value: `_tmp = move _g` gives _tmp the same
+    // lock, so an unlinked temp inherits its source's class instead of looking
+    // like an unknown lock.
+    let unlinked: Vec<Local> = guard_kind
+        .keys()
+        .copied()
+        .filter(|gl| !guard_class.contains_key(gl))
+        .collect();
+    for gl in unlinked {
+        if let Some(cls) = move_chain(body, gl)
+            .into_iter()
+            .find_map(|l| guard_class.get(&l).cloned())
+        {
+            guard_class.insert(gl, cls);
+        }
     }
+    // A guard whose class is still unknown only costs us an edge if something
+    // actually happens while it is held. Deciding that needs the liveness
+    // solution, so record the set now and judge below.
+    let unknown_guards: BTreeSet<Local> = guard_kind
+        .keys()
+        .copied()
+        .filter(|gl| !guard_class.contains_key(gl))
+        .collect();
 
     // --- pass 3: gen/kill liveness of guard locals -----------------------------
     let guard_locals: BTreeSet<Local> = guard_kind.keys().copied().collect();
     let mut gk = GuardGenKill { guards: &guard_locals, gens: BTreeMap::new(), kill: BTreeMap::new() };
     gk.visit_body(body);
+    for (loc, local) in &explicit_drops {
+        if guard_locals.contains(local) {
+            gk.kill.entry(*loc).or_default().insert(*local);
+        }
+    }
 
     // Forward may-live fixpoint over basic blocks; join = UNION (sound upper
     // bound on the held-set, matching lockbud's join). We compute the live set
     // at every Location, then read it at each acquire Location.
     let live = solve_live(body, &gk);
+
+    // Fail closed only where it matters: an unknown held lock is invisible in
+    // the held-set, so any acquisition or call made while it is live loses an
+    // ordering edge. If nothing happens under it (e.g. a guard merely passed
+    // through a function), no edge is lost and the verdict stays conclusive.
+    if !unknown_guards.is_empty() {
+        let mut sites: Vec<Location> = acquires.iter().map(|a| a.loc).collect();
+        sites.extend(local_calls.iter().map(|(l, _)| *l));
+        sites.extend(param_calls.iter().map(|(l, _)| *l));
+        sites.extend(cs_enters.iter().map(|(l, _)| *l));
+        sites.extend(opaque_calls.iter().copied());
+        for loc in sites {
+            let here = live.get(&loc).cloned().unwrap_or_default();
+            if let Some(gl) = here.iter().find(|l| unknown_guards.contains(l)) {
+                let (kind, data) = &guard_kind[gl];
+                mark_incomplete(format!(
+                    "in {function}: a {kind}<{data}> guard whose lock class could not                      be determined is held at {}, so that held-set is missing an entry",
+                    span_to_site(tcx, body, loc)
+                ));
+                break;
+            }
+        }
+    }
 
     // --- emit one Event per acquire --------------------------------------------
     PROGRAM.with(|prog| {
@@ -548,9 +714,9 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
                     held.insert(cls.clone());
                 }
             }
-            if held.is_empty() {
-                continue; // nothing held: no ordering edge can be lost here
-            }
+            // Do NOT drop records with an empty LOCAL held-set: a lock held by
+            // a caller is only known after the interprocedural fixpoint, which
+            // runs on the stable side. Emptiness is not ours to decide.
             prog.opaque_calls.push(OpaqueCall {
                 function: function.clone(),
                 site: span_to_site(tcx, body, *loc),
@@ -612,6 +778,17 @@ fn lock_class_of_receiver<'tcx>(
         } else {
             break;
         }
+    }
+    // If the base local is the RESULT OF A CALL (an accessor handing back a
+    // reference to the lock), the projection chain we can see is not the lock's
+    // canonical path: the SAME physical lock reached through a field would get a
+    // different symbol. Splitting one lock into two class names is NOT
+    // conservative -- the two nodes can never close a cycle between them -- so
+    // the verdict stops being conclusive.
+    if is_call_destination(body, cur.local) {
+        mark_incomplete(format!(
+            "a lock reached through an accessor (a call returning a reference) has              no canonical class path, so it may not unify with the same lock              reached directly"
+        ));
     }
     // Build a stable symbol from the base local's TYPE + the projection chain.
     // We walk the type alongside the projections so field components can carry
@@ -729,8 +906,13 @@ impl<'a, 'tcx> Visitor<'tcx> for GuardGenKill<'a> {
             | PlaceContext::MutatingUse(MutatingUseContext::Call) => {
                 self.gens.entry(loc).or_default().insert(local);
             }
-            PlaceContext::MutatingUse(MutatingUseContext::Drop)
-            | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) => {
+            // NOTE: a plain Move is a TRANSFER of the guard, not a release --
+            // pushing a guard into a Vec, storing it in a struct, or returning it
+            // all move it while the lock stays held. Killing on every Move drops
+            // a still-held lock from later held-sets (a false negative). Only
+            // Drop and StorageDead (below), plus an explicit mem::drop call
+            // handled in the terminator scan, actually release.
+            PlaceContext::MutatingUse(MutatingUseContext::Drop) => {
                 self.kill.entry(loc).or_default().insert(local);
             }
             _ => {}

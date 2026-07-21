@@ -129,6 +129,14 @@ def analyze_fn(name, lines, local_fns=frozenset()):
                 held = sorted({gclass[g] for g in st if g in gclass})
                 if held:
                     unresolved.append((name, held))
+        # An acquisition whose receiver class could not be resolved (e.g. the
+        # lock came back from an accessor) would be a FABRICATED class name:
+        # a node nothing else mentions, which can never close a cycle. That is
+        # a false negative, not a conservative choice, so fail closed.
+        for (_fn, _held, acq) in events:
+            if acq == '?':
+                unresolved.append((name, ['<unresolved lock class>']))
+                break
     return events, calls, unresolved
 
 def analyze_text(text):

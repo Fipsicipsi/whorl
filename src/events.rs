@@ -187,28 +187,53 @@ pub fn parse(src: &str) -> Result<Program, String> {
     // ABSENCE of one is not conclusive.
     let mut unresolved: Option<String> = None;
     for (g, i, held_at_call) in &param_calls {
-        if held_at_call.is_empty() {
-            continue;
+        // "Is a lock held here?" is an INTERPROCEDURAL question: a caller's lock
+        // reaches this site through entry_may. Testing the local held-set alone
+        // silently skips a callback invoked under a caller's lock.
+        let mut effective = held_at_call.clone();
+        if let Some(from_callers) = entry_may.get(g) {
+            effective.extend(from_callers.iter().cloned());
         }
-        let resolved = closure_args
+        if effective.is_empty() {
+            continue; // genuinely nothing held: no ordering edge can be lost
+        }
+        // Resolution must be UNIVERSAL, not existential. "<unknown>" marks a
+        // callable that reached this position unnameable; a sibling call passing
+        // a real closure must not make the whole position look resolved.
+        let any_named = closure_args
             .iter()
-            .any(|(callee, p, _)| callee == g && p == i);
-        if !resolved {
+            .any(|(callee, p, cl)| callee == g && p == i && cl != "<unknown>");
+        let any_unknown = closure_args
+            .iter()
+            .any(|(callee, p, cl)| callee == g && p == i && cl == "<unknown>");
+        if !any_named || any_unknown {
             unresolved = Some(format!(
-                "{g} calls its parameter #{i} while holding {held_at_call:?},                  and no callable passed there could be resolved"
+                "{g} calls its parameter #{i} while holding {effective:?}, and not \
+                 every callable passed there could be resolved"
             ));
             break;
         }
     }
     if unresolved.is_none() {
         if let Some(Value::Arr(ocs)) = top.get("opaque_calls") {
-            if let Some(Value::Obj(c)) = ocs.first() {
-                let f = str_field(c, "function", 0)?;
-                let s = str_field(c, "site", 0)?;
-                let held = held_field(c, "opaque_calls", 0)?;
+            for (idx, c) in ocs.iter().enumerate() {
+                let Value::Obj(c) = c else {
+                    return Err(format!("opaque_calls[{idx}] is not an object"));
+                };
+                let f = str_field(c, "function", idx)?;
+                let s = str_field(c, "site", idx)?;
+                let mut effective = held_field(c, "opaque_calls", idx)?;
+                if let Some(from_callers) = entry_may.get(&f) {
+                    effective.extend(from_callers.iter().cloned());
+                }
+                if effective.is_empty() {
+                    continue;
+                }
                 unresolved = Some(format!(
-                    "unresolved indirect call (fn pointer or trait object) at                      {s} in {f} while holding {held:?}"
+                    "unresolved indirect call (fn pointer, trait object or \
+                     unnameable callable) at {s} in {f} while holding {effective:?}"
                 ));
+                break;
             }
         }
     }
@@ -594,6 +619,53 @@ mod tests {
         let src = r#"{
   "events": [ { "function": "g", "site": "s:1", "acquires": "L", "held": [] } ],
   "param_calls": [ { "function": "g", "param": 1, "held": ["L"] } ]
+}"#;
+        let prog = parse(src).unwrap();
+        assert!(prog.incomplete.is_some());
+    }
+
+    #[test]
+    fn one_benign_closure_does_not_whitewash_an_unknown_callable() {
+        // Adversarial review finding: the resolution test used to be existential,
+        // so a do-nothing closure passed at (with_a, #2) made the position look
+        // resolved even though another caller forwarded an unnameable callable
+        // to the same position. Resolution must be universal.
+        let src = r#"{
+  "events": [ { "function": "with_a", "site": "s:1", "acquires": "A", "held": [] } ],
+  "param_calls":  [ { "function": "with_a", "param": 2, "held": ["A"] } ],
+  "closure_args": [
+    { "function": "benign",  "callee": "with_a", "param": 2, "closure": "benign::{closure#0}" },
+    { "function": "forward", "callee": "with_a", "param": 2, "closure": "<unknown>" }
+  ]
+}"#;
+        let prog = parse(src).unwrap();
+        assert!(
+            prog.incomplete.is_some(),
+            "an unknown callable at the same position must still force incomplete"
+        );
+    }
+
+    #[test]
+    fn a_lock_held_by_the_caller_counts_at_an_unresolved_callback() {
+        // Adversarial review finding: the emptiness test used to read the LOCAL
+        // held-set only. run_hook holds nothing itself, but every caller reaches
+        // it holding L, which the entry-may fixpoint knows.
+        let src = r#"{
+  "events": [ { "function": "under_l", "site": "s:1", "acquires": "L", "held": [] } ],
+  "calls":       [ { "function": "under_l", "callee": "run_hook", "held": ["L"] } ],
+  "param_calls": [ { "function": "run_hook", "param": 1, "held": [] } ]
+}"#;
+        let prog = parse(src).unwrap();
+        let reason = prog.incomplete.expect("caller's lock must count");
+        assert!(reason.contains("run_hook"));
+    }
+
+    #[test]
+    fn an_opaque_call_under_a_callers_lock_counts_too() {
+        let src = r#"{
+  "events": [ { "function": "under_l", "site": "s:1", "acquires": "L", "held": [] } ],
+  "calls":        [ { "function": "under_l", "callee": "dispatch", "held": ["L"] } ],
+  "opaque_calls": [ { "function": "dispatch", "site": "d.rs:3", "held": [] } ]
 }"#;
         let prog = parse(src).unwrap();
         assert!(prog.incomplete.is_some());

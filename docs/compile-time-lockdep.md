@@ -96,8 +96,15 @@ behind `.ok().unwrap()` on a match temporary, a `lazy_static` static, and an
 inversion split across two thread closures.
 
 **3. Real code, and the embedded hazard nobody else models.** The lint runs on
-`tracing-core` (billions of downloads, ~6200 lines) without crashing and returns
-a correct `[SAFE]`. And on real `no_std` code using the real `cortex-m` crate,
+`tracing-core` (billions of downloads, ~6200 lines) without crashing. It returns
+`[INCOMPLETE]`, not `[SAFE]`: tracing-core reaches a lock through an accessor
+returning a reference, and Whorl cannot give that lock a canonical class path,
+so it refuses to claim a conclusive verdict. An earlier version did say `[SAFE]`
+there -- an adversarial review showed that verdict was not justified, because
+the same physical lock reached two different ways was being split into two class
+symbols that can never close a cycle. Fixing it cost precision on real code and
+bought back soundness, which is the correct direction for this tool. On real
+`no_std` code using the real `cortex-m` crate,
 compiled for `thumbv7em-none-eabihf`, it catches the genuine single-core hazard:
 a critical section and a bus spinlock taken in inconsistent orders.
 
@@ -125,6 +132,10 @@ treating interrupt masking as a resource in the same order graph as the locks.
 - The class abstraction merges instances a points-to analysis would separate, so
   two distinct same-type locals locked in a consistent order read as a false
   positive. That is the Havender trade: soundness over precision.
+- A lock reached through an accessor (a method returning a reference or a guard)
+  has no canonical class path, so it forces `[INCOMPLETE]` rather than risking a
+  split class. This fires on ordinary Rust and is the biggest open precision
+  problem; resolving simple accessors interprocedurally is the obvious next step.
 - `[SAFE]` means no lock-ordering deadlock. Condition-variable lost wakeups,
   channel and actor cycles, external resources, and multicore preemption are out
   of scope and say nothing about them.

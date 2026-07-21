@@ -67,6 +67,8 @@ def verdict(name):
     v = subprocess.run([WHORL, "--events", events], capture_output=True, text=True)
     if "[DEADLOCK]" in v.stdout:
         return "DEADLOCK", ""
+    if "[INCOMPLETE]" in v.stdout:
+        return "INCOMPLETE", ""
     if "[SAFE]" in v.stdout:
         return "SAFE", ""
     return "ERR", "no verdict"
@@ -81,7 +83,9 @@ def main():
     fn, other = 0, 0
     for name, expect in TOYS.items():
         got, note = verdict(name)
-        if got == "ERR":
+        if got == "INCOMPLETE":
+            status = "incomplete (fail-closed)"
+        elif got == "ERR":
             status = f"ERR ({note})"
         elif got == expect:
             status = "ok"

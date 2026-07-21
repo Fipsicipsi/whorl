@@ -145,6 +145,38 @@ Reproducing needs a lockbud checkout (`LOCKBUD_SRC`, default `../../../lockbud-s
 for the toy sources; the toys pull `parking_lot`/`spin`/`lazy_static` from
 crates.io on first run.
 
+## The adversarial review round
+
+A multi-agent review was pointed at the callback-resolution work with one
+instruction: construct programs where Whorl says SAFE but a deadlock exists. It
+confirmed eight defects, and the verdict was blunt -- "Whorl is NOT sound
+today". Two root causes:
+
+1. **Class derivation was splitting and renaming locks.** A lock reached through
+   an accessor got a different class symbol than the same lock reached through
+   its field path, and a guard whose class could not be linked was given a
+   fabricated `@unlinked:N` name. Both were commented in the source as
+   conservative. They are the opposite: coarsening a class is sound, splitting
+   or renaming one is not, because an invented node can never close a cycle.
+2. **Every fail-closed test read pre-widening, intraprocedural state.** The
+   `incomplete` field existed and was never assigned anywhere in the lint. The
+   emptiness tests ignored the entry-may set the same pass had just computed, so
+   a callback invoked under a *caller's* lock never tripped them; the front end
+   deleted opaque calls whose local held-set was empty before the stable side
+   could widen them; the resolution test was existential, so one benign closure
+   whitewashed a whole parameter position; and a critical section whose closure
+   could not be named was dropped wholesale.
+
+All eight are fixed. The rule that came out of it: **the front end must not
+decide whether a lock is held** -- only the stable side, after the
+interprocedural fixpoint, can. `accessor_class_split_deadlock.rs` is the
+regression test for root cause 1.
+
+The cost was real and is visible in the field trial: `tracing-core` moved from
+`[SAFE]` to `[INCOMPLETE]`, because it reaches a lock through an accessor. That
+is the correct direction -- the old `[SAFE]` was not justified -- and it names
+the next precision problem to solve.
+
 ## Caveats
 
 This corpus is tiny. Fourteen labeled cases beat zero, and the head-to-head
