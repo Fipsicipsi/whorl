@@ -120,8 +120,8 @@ a critical section and a bus spinlock taken in inconsistent orders.
 
 ```
 [DEADLOCK]
-  <critical-section>  <  spin::Mutex   via task_write::{closure#0}
-  spin::Mutex  <  <critical-section>   via driver_flush
+  <critical-section>  <  BUS   via task_write::{closure#0} @ src/lib.rs:12
+  BUS  <  <critical-section>   via driver_flush @ src/lib.rs:21
 ```
 
 An interrupt fires while a driver holds the spinlock; the masked path then needs
@@ -130,7 +130,7 @@ treating interrupt masking as a resource in the same order graph as the locks.
 
 ## Honest limits
 
-- The corpus is 18 hand-labeled cases plus Lockbud's toys. That is evidence, not
+- The corpus is 20 hand-labeled cases plus Lockbud's toys. That is evidence, not
   a proof. A general soundness claim needs scale and, ideally, a mechanized core.
 - Soundness is argued and tested, not mechanically verified. Development found
   and fixed seven real soundness bugs across the review passes; there may be more.

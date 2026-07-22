@@ -33,7 +33,7 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 18 cases, 16/18 match, 0 false negatives, 1 false
+Current status on this corpus: 20 cases, 18/20 match, 0 false negatives, 1 false
 positive, 1 fail-closed `[INCOMPLETE]`. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
 (a guard held across a call was invisible in the callee), which was then fixed
 by call-edge tracking plus an entry-may fixpoint -- in the lint/solver pipeline
@@ -56,7 +56,7 @@ ownership, so the held-set follows the value, and `mem::drop` kills it.
 `whorl --events`) on every case and cross-checks it against both the ground
 truth and the stable-MIR PoC. Two independent implementations of the same
 analysis on the same corpus is a differential test in itself: any disagreement
-is a bug in one of them. Current status: 16/18 match ground truth, 0 false
+is a bug in one of them. Current status: 18/20 match ground truth, 0 false
 negatives, 0 divergences between the two implementations; the two misses are the
 deliberate Havender false positive and one fail-closed `[INCOMPLETE]` (the
 two-path accessor, which genuinely cannot be resolved to a single lock). Where the PoC fails closed
@@ -240,12 +240,22 @@ place (drop the suffix's leading deref, which that borrow already supplied).
 One deref too many or too few is a different symbol, and a different symbol is a
 lock the cycle can never reach.
 
-Known precision cost of the erasure: two locks distinguished ONLY by payload
-type merge. In `tracing-core` the callsite `Mutex` and the dispatcher `RwLock`
-are both reached through a `Lazy` deref and now share one class. Merging is
-safe, but the underlying gap is that a lock rooted in a STATIC is identified by
-its type rather than by the static itself. Static identity is the next precision
-item.
+**Static identity** closed the precision gap that erasure exposed. A static lock
+has a NAME, but the receiver only carries its TYPE, so two distinct statics of
+the same type collapsed into one class -- and two statics taken in a consistent
+order then read as a same-class self-edge, a false positive
+(`two_statics_consistent_safe.rs`). The identity is now recovered from the
+constant's allocation (`_t = const {alloc: &T}`), and every site that builds a
+symbol goes through one static-aware renderer, so a lock reached one way cannot
+carry the static's name while the same lock reached another way carries only its
+type. `two_statics_inverted_deadlock.rs` guards the other direction: telling the
+two apart must not lose the real cycle.
+
+The diagnostics got much better as a side effect, because classes are now named
+the way the source names them. In `tracing-core` the two registries separate
+into `callsite::LOCKED_CALLSITES` and `callsite::dispatchers::LOCKED_DISPATCHERS`
+instead of collapsing into one opaque `Lazy` type, and the embedded witness reads
+`<critical-section> < BUS` rather than `&spin::mutex::Mutex<u32>.*`.
 
 ## Caveats
 

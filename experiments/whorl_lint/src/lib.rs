@@ -491,6 +491,66 @@ fn resolve_callee<'tcx>(
     }
 }
 
+/// Render a place as a class base, preferring a STATIC's name over its type.
+/// Every site that builds a symbol must go through this, or a lock reached one
+/// way carries the static's identity and the same lock reached another way
+/// carries only its type -- two symbols, one lock, a split.
+fn render_base<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    place: Place<'tcx>,
+) -> (String, String) {
+    if let Some(did) = static_def_of(tcx, body, place.local) {
+        let base = tcx.def_path_str(did);
+        // The constant is a REFERENCE to the static, so a leading deref just
+        // names the static itself and must not appear in the symbol.
+        let proj: &[PlaceElem<'tcx>] = match place.projection.first() {
+            Some(PlaceElem::Deref) => &place.projection[1..],
+            _ => place.projection,
+        };
+        let static_ty = tcx.type_of(did).skip_binder();
+        let (sym, id) = render_projection(static_ty, proj);
+        return (format!("{base}{sym}"), format!("{base}{id}"));
+    }
+    render_place(body, place)
+}
+
+/// If `local` holds a reference to a `static`, return that static's DefId.
+///
+/// A static lock is a single global instance with a NAME, but the receiver only
+/// carries its TYPE, so two different statics of the same type used to collapse
+/// into one class -- a merge, therefore safe, but needlessly imprecise: two
+/// statics consistently ordered read as a same-class self-edge, i.e. a false
+/// positive. In MIR the access is `_t = const {alloc: &T}`, so the identity is
+/// recovered from the constant's allocation.
+fn static_def_of<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, local: Local) -> Option<DefId> {
+    let mut found = None;
+    for data in body.basic_blocks.iter() {
+        for stmt in &data.statements {
+            if let StatementKind::Assign(boxed) = &stmt.kind {
+                let (dest, rvalue) = &**boxed;
+                if dest.local != local || !dest.projection.is_empty() {
+                    continue;
+                }
+                if let Rvalue::Use(Operand::Constant(c)) = rvalue {
+                    if found.is_some() {
+                        return None; // several definitions: not a stable identity
+                    }
+                    found = Some(c.const_);
+                }
+            }
+        }
+    }
+    let scalar = found?.try_to_scalar()?;
+    let rustc_middle::mir::interpret::Scalar::Ptr(ptr, _) = scalar else {
+        return None;
+    };
+    match tcx.global_alloc(ptr.provenance.alloc_id()) {
+        rustc_middle::mir::interpret::GlobalAlloc::Static(did) => Some(did),
+        _ => None,
+    }
+}
+
 /// True if `local` is defined by a Call terminator, i.e. it holds a value
 /// returned by a function. The receiver resolution can only see through
 /// borrows, so a lock reached this way has no canonical field path.
@@ -1088,7 +1148,7 @@ fn lock_class_of_receiver<'tcx>(
                             }
                             _ => (*argp, suffix_sym.as_str()),
                         };
-                    let (base_sym, base_id) = render_place(body, base_place);
+                    let (base_sym, base_id) = render_base(tcx, body, base_place);
                     return (format!("{base_sym}{sym}"), format!("{base_id}{suffix_id}"));
                 }
             }
@@ -1100,14 +1160,14 @@ fn lock_class_of_receiver<'tcx>(
                     let argp = resolve_place_root(body, *argp);
                     let arg_ty = body.local_decls[argp.local].ty;
                     if deref_preserves_pointee(tcx, arg_ty) {
-                        let (base_sym, base_id) = render_place(body, argp);
+                        let (base_sym, base_id) = render_base(tcx, body, argp);
                         return (format!("{base_sym}.*"), format!("{base_id}.*"));
                     }
                 }
             }
             if let Some((pix, suffix_sym, suffix_id)) = accessors.get(&callee) {
                 if let Some(argp) = arg_places.get(pix.saturating_sub(1)) {
-                    let (base_sym, base_id) = render_place(body, *argp);
+                    let (base_sym, base_id) = render_base(tcx, body, *argp);
                     return (
                         format!("{base_sym}{suffix_sym}"),
                         format!("{base_id}{suffix_id}"),
@@ -1122,7 +1182,7 @@ fn lock_class_of_receiver<'tcx>(
             "a lock is reached through `{via}`, whose body is not a simple field              accessor, so it has no canonical class path and may not unify with              the same lock reached directly"
         ));
     }
-    render_place(body, cur)
+    render_base(tcx, body, cur)
 }
 
 /// If `local` is defined by exactly one statement of the form `local = &SRC`

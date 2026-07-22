@@ -23,9 +23,11 @@ whorl --events events.json
   consts, statics, and shims that must be skipped, not crashed on.
 - **274 call edges** were recorded, so the interprocedural machinery runs at real
   scale, not just on toys.
-- **Two lock classes** were found and named from real types:
-  `std::sync::Mutex<Vec<&dyn Callsite>>` (the callsite registry) and
-  `std::sync::RwLock<Vec<Registrar>>` (the dispatcher registry).
+- **Two lock classes** were found, named the way the source names them:
+  `callsite::LOCKED_CALLSITES` and `callsite::dispatchers::LOCKED_DISPATCHERS`.
+  Both are statics reached through a `once_cell::Lazy` deref; recovering the
+  static's identity is what keeps them apart (and readable) rather than
+  collapsing them into one opaque wrapper type.
 - **Verdict: `[INCOMPLETE]`**, with a precise reason:
 
   ```
