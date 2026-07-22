@@ -37,7 +37,7 @@ use rustc_middle::mir::visit::{
 use rustc_middle::mir::{
     Body, Local, Location, Operand, Place, PlaceElem, Rvalue, StatementKind, TerminatorKind,
 };
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 
 // declare_late_lint! auto-generates dylint_library!, register_lints, the
 // declare_lint! item, and the pass struct (named `WhorlLockOrder`). This is the
@@ -362,6 +362,21 @@ fn render_projection<'tcx>(
 /// Render a whole place: its base local's TYPE plus its projection chain.
 fn render_place<'tcx>(body: &Body<'tcx>, place: Place<'tcx>) -> (String, String) {
     let base_ty = body.local_decls[place.local].ty;
+    // Symbols are rendered TYPE TEXT. A generic body is analyzed un-monomorphized,
+    // so a lock in `Pair<T>` renders with a literal `T` while the same lock seen
+    // from a concrete body renders with `i32` -- one lock, two symbols, a SPLIT.
+    // We cannot canonicalize the parameter away, so we stop claiming a
+    // conclusive verdict.
+    if base_ty.has_non_region_param()
+        || place.projection.iter().any(|e| match e {
+            PlaceElem::Field(_, fty) => fty.has_non_region_param(),
+            _ => false,
+        })
+    {
+        mark_incomplete(format!(
+            "a lock class is rendered from the polymorphic type `{base_ty}`; a              generic body and a concrete one would render the same lock              differently, so they cannot be unified"
+        ));
+    }
     let (sym, id) = render_projection(base_ty, place.projection);
     (
         format!("{base_ty}{sym}"),
@@ -375,29 +390,49 @@ fn render_place<'tcx>(body: &Body<'tcx>, place: Place<'tcx>) -> (String, String)
 /// That lets a caller reach the SAME canonical class through the accessor as it
 /// would by touching the field directly, instead of splitting the lock in two.
 fn accessor_summary<'tcx>(body: &Body<'tcx>) -> Option<(usize, String, String)> {
+    let chain: BTreeSet<Local> = move_chain(body, Local::from_u32(0)).into_iter().collect();
     let mut found: Option<(usize, String, String)> = None;
-    for l in move_chain(body, Local::from_u32(0)) {
-        for data in body.basic_blocks.iter() {
-            for stmt in &data.statements {
-                if let StatementKind::Assign(boxed) = &stmt.kind {
-                    let (dest, rvalue) = &**boxed;
-                    if dest.local != l || !dest.projection.is_empty() {
-                        continue;
+    for data in body.basic_blocks.iter() {
+        // A tail call writes the return value from a TERMINATOR, not a
+        // statement. Scanning only statements would see a two-path accessor as
+        // single-path and summarize it from the branch not taken, relabelling
+        // one lock as another. Any non-Ref definition of the return chain
+        // disqualifies the body.
+        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
+            if chain.contains(&destination.local) {
+                return None;
+            }
+        }
+        for stmt in &data.statements {
+            let StatementKind::Assign(boxed) = &stmt.kind else {
+                continue;
+            };
+            let (dest, rvalue) = &**boxed;
+            if !chain.contains(&dest.local) {
+                continue;
+            }
+            if !dest.projection.is_empty() {
+                return None; // writing through a projection: not a simple accessor
+            }
+            match rvalue {
+                Rvalue::Ref(_, _, src) => {
+                    let src = resolve_place_root(body, *src);
+                    let idx = src.local.as_usize();
+                    if idx == 0 || idx > body.arg_count {
+                        return None; // not rooted in a parameter
                     }
-                    if let Rvalue::Ref(_, _, src) = rvalue {
-                        let src = resolve_place_root(body, *src);
-                        let idx = src.local.as_usize();
-                        if idx == 0 || idx > body.arg_count {
-                            return None; // not rooted in a parameter
-                        }
-                        if found.is_some() {
-                            return None; // several return paths: not simple
-                        }
-                        let start_ty = body.local_decls[src.local].ty;
-                        let (sym, id) = render_projection(start_ty, src.projection);
-                        found = Some((idx, sym, id));
+                    if found.is_some() {
+                        return None; // several return paths: not simple
                     }
+                    let start_ty = body.local_decls[src.local].ty;
+                    let (sym, id) = render_projection(start_ty, src.projection);
+                    found = Some((idx, sym, id));
                 }
+                // A plain move/copy is how the return chain itself is built.
+                Rvalue::Use(Operand::Move(_) | Operand::Copy(_)) => {}
+                // Anything else defining the return value means this body does
+                // more than hand back a field reference.
+                _ => return None,
             }
         }
     }
@@ -473,6 +508,43 @@ fn move_chain<'tcx>(body: &Body<'tcx>, start: Local) -> Vec<Local> {
         }
     }
     chain
+}
+
+/// True if dereferencing a value of this type yields the POINTEE, so that
+/// rendering the deref as `.*` matches what a built-in deref would produce.
+/// A user-defined `Deref` may instead return a reference to a FIELD, and
+/// rendering that as `.*` would invent a symbol that can never equal the
+/// field-path symbol the same lock gets when reached directly -- a SPLIT, and
+/// therefore a false negative. So this is an explicit allowlist, and anything
+/// not on it falls through to the fail-closed path.
+fn deref_preserves_pointee<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let mut t = ty;
+    while let ty::TyKind::Ref(_, inner, _) = t.kind() {
+        t = *inner;
+    }
+    if matches!(t.kind(), ty::TyKind::RawPtr(..)) {
+        return true;
+    }
+    if t.is_box() {
+        return true;
+    }
+    let ty::TyKind::Adt(adt, _) = t.kind() else {
+        return false;
+    };
+    let p = strip_generics(&tcx.def_path_str(adt.did()));
+    matches!(
+        p.as_str(),
+        "std::sync::Arc"
+            | "alloc::sync::Arc"
+            | "std::rc::Rc"
+            | "alloc::rc::Rc"
+            | "std::boxed::Box"
+            | "alloc::boxed::Box"
+            | "std::sync::LazyLock"
+            | "std::cell::LazyCell"
+            | "std::pin::Pin"
+    ) || p.ends_with("::Lazy")
+        || p.ends_with("Guard")
 }
 
 /// True if `did` is `Deref::deref` / `DerefMut::deref_mut`. Semantically the
@@ -955,11 +1027,18 @@ fn lock_class_of_receiver<'tcx>(
         let extra_ok = cur.projection.is_empty()
             || (cur.projection.len() == 1 && matches!(cur.projection[0], PlaceElem::Deref));
         if let (true, Some((callee, arg_places))) = (extra_ok, call_defining(body, cur.local)) {
-            // `deref(x)` is `(*x)`: render it as the built-in deref would.
+            // `deref(x)` is `(*x)` ONLY when the deref yields the pointee. For a
+            // user-defined Deref returning a field, rendering `.*` would invent a
+            // symbol that can never match the field path -- so that case falls
+            // through to fail-closed below.
             if is_deref_call(tcx, callee) {
                 if let Some(argp) = arg_places.first() {
-                    let (base_sym, base_id) = render_place(body, *argp);
-                    return (format!("{base_sym}.*"), format!("{base_id}.*"));
+                    let argp = resolve_place_root(body, *argp);
+                    let arg_ty = body.local_decls[argp.local].ty;
+                    if deref_preserves_pointee(tcx, arg_ty) {
+                        let (base_sym, base_id) = render_place(body, argp);
+                        return (format!("{base_sym}.*"), format!("{base_id}.*"));
+                    }
                 }
             }
             if let Some((pix, suffix_sym, suffix_id)) = accessors.get(&callee) {

@@ -35,6 +35,12 @@ CALL   = re.compile(r'_\d+ = (\w+)\((?:move|copy) ')
 # dylint front-end resolves these by binding closures to parameters; here we
 # only fail closed.
 INDIRECT = re.compile(r'= <.*? as (?:FnOnce|FnMut|Fn)<[^>]*>>::call(?:_once|_mut)?\(')
+# A class symbol is rendered TYPE TEXT, and a generic body is analyzed
+# un-monomorphized: `Mutex<T>` in a generic function and `Mutex<i32>` in a
+# concrete one are the SAME lock rendered as two symbols, which can never close
+# a cycle. Bare type parameters are recognized conservatively (T, U, K, V, T1)
+# and force a fail-closed verdict rather than a wrong SAFE.
+TYPE_PARAM = re.compile(r'^[A-Z][0-9]?$')
 FN     = re.compile(r'^fn (\w+)\(')
 BB     = re.compile(r'^\s*bb(\d+): \{')
 SUCC   = re.compile(r'bb(\d+)')
@@ -136,6 +142,11 @@ def analyze_fn(name, lines, local_fns=frozenset()):
         for (_fn, _held, acq) in events:
             if acq == '?':
                 unresolved.append((name, ['<unresolved lock class>']))
+                break
+        for (_fn, _held, acq) in events:
+            inner = acq.split('<', 1)[1].rsplit('>', 1)[0] if '<' in acq else ''
+            if TYPE_PARAM.match(inner):
+                unresolved.append((name, [f'<polymorphic lock class {acq}>']))
                 break
     return events, calls, unresolved
 

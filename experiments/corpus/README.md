@@ -33,8 +33,8 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 14 cases, 13/14 match, 0 false negatives, 1 false
-positive. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
+Current status on this corpus: 18 cases, 14/18 match, 0 false negatives, 1 false
+positive, 3 fail-closed `[INCOMPLETE]`. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
 (a guard held across a call was invisible in the callee), which was then fixed
 by call-edge tracking plus an entry-may fixpoint -- in the lint/solver pipeline
 and in the PoC alike. `closure_call_deadlock.rs` is the same story one level
@@ -177,9 +177,44 @@ The cost was real and is visible in the field trial: `tracing-core` moved from
 is the correct direction -- the old `[SAFE]` was not justified -- and it names
 the next precision problem to solve.
 
+## The second adversarial round
+
+The class-derivation rewrite was itself attacked, on the principle that the code
+which just failed a review is the code most likely to fail the next one. Three
+more false negatives came out, all of the same SPLIT shape, and all of them
+paths that returned BEFORE reaching the fail-closed marker:
+
+1. **The `Deref` shortcut applied to every `Deref` impl.** Rendering `deref(x)`
+   as `(*x)` is right for `Arc`/`Rc`/`Box`/`Lazy`, where the deref yields the
+   pointee. A user-defined `impl Deref for W { fn deref(&self) -> &Mutex<i32> {
+   &self.inner } }` returns a FIELD, so the same mutex rendered as `&W.*` one
+   way and `&S.*.a:W.inner:Mutex<i32>` the other. It is now an explicit
+   allowlist of pointee-preserving wrappers; everything else falls through to
+   fail-closed. The review also killed the obvious-looking alternative fix:
+   MIR keeps the TRAIT item's DefId for trait-method calls, so looking
+   `Deref::deref` up in the accessor summaries can never hit.
+2. **The accessor summary's single-path guard scanned only statements.** A
+   returned value routinely arrives from a TERMINATOR (a tail call), so a
+   two-path accessor looked single-path and was summarized from the branch not
+   taken -- relabelling one lock as another and severing the ring at that node.
+   The guard is now total over every definition of the return chain.
+3. **Class symbols embed rendered type text, and generic bodies are analyzed
+   un-monomorphized.** A lock in `Pair<T>` renders `Mutex<T>` while the same
+   lock seen from a concrete body renders `Mutex<i32>`: one lock, two symbols.
+   Polymorphic symbols now fail closed, in both implementations.
+
+`deref_field_split_deadlock.rs`, `two_path_accessor_deadlock.rs` and
+`generic_class_split_deadlock.rs` are the regression tests. All three are real
+AB/BA deadlocks that used to read `[SAFE]` and now fail closed.
+
+The pattern across both rounds is worth stating plainly: every defect found so
+far has been a SPLIT (one lock, two symbols) or a fail-closed test reading
+pre-widening state. Merging is safe; splitting is not. That is the invariant to
+attack first next time.
+
 ## Caveats
 
-This corpus is tiny. Fourteen labeled cases beat zero, and the head-to-head
+This corpus is tiny. Eighteen labeled cases beat zero, and the head-to-head
 result is real, but it cannot carry a general soundness claim. Growing it --
 the published Lockbud/Archerfish real-world bugs, real driver/HAL-shaped SAFE
 code, locks behind closures and trait objects (the known remaining blind spot
