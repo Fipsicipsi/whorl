@@ -33,8 +33,8 @@ not equal:
 - **False positive** (labeled SAFE, tool says DEADLOCK) -- acceptable, but
   tracked, because too many make the tool useless.
 
-Current status on this corpus: 18 cases, 14/18 match, 0 false negatives, 1 false
-positive, 3 fail-closed `[INCOMPLETE]`. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
+Current status on this corpus: 18 cases, 16/18 match, 0 false negatives, 1 false
+positive, 1 fail-closed `[INCOMPLETE]`. `cross_call_deadlock.rs` was added as a deliberate red test: it proved both implementations had an interprocedural false negative
 (a guard held across a call was invisible in the callee), which was then fixed
 by call-edge tracking plus an entry-may fixpoint -- in the lint/solver pipeline
 and in the PoC alike. `closure_call_deadlock.rs` is the same story one level
@@ -56,10 +56,10 @@ ownership, so the held-set follows the value, and `mem::drop` kills it.
 `whorl --events`) on every case and cross-checks it against both the ground
 truth and the stable-MIR PoC. Two independent implementations of the same
 analysis on the same corpus is a differential test in itself: any disagreement
-is a bug in one of them. Current status: 14/18 match ground truth, 0 false
-negatives, 0 divergences between the two implementations; the misses are one
-deliberate Havender false positive and three fail-closed `[INCOMPLETE]`
-verdicts on the class-split regression cases. Where the PoC fails closed
+is a bug in one of them. Current status: 16/18 match ground truth, 0 false
+negatives, 0 divergences between the two implementations; the two misses are the
+deliberate Havender false positive and one fail-closed `[INCOMPLETE]` (the
+two-path accessor, which genuinely cannot be resolved to a single lock). Where the PoC fails closed
 (`[INCOMPLETE]`) and the lint resolves the case, that is recorded as
 `ok (poc fail-closed)`, not a divergence -- one implementation being more
 capable is fine, one being wrong is not.
