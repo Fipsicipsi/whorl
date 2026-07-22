@@ -56,9 +56,10 @@ ownership, so the held-set follows the value, and `mem::drop` kills it.
 `whorl --events`) on every case and cross-checks it against both the ground
 truth and the stable-MIR PoC. Two independent implementations of the same
 analysis on the same corpus is a differential test in itself: any disagreement
-is a bug in one of them. Current status: 13/14 match ground truth, 0 false
-negatives, 0 divergences between the two implementations; the single miss is
-the same deliberate Havender false positive in both. Where the PoC fails closed
+is a bug in one of them. Current status: 14/18 match ground truth, 0 false
+negatives, 0 divergences between the two implementations; the misses are one
+deliberate Havender false positive and three fail-closed `[INCOMPLETE]`
+verdicts on the class-split regression cases. Where the PoC fails closed
 (`[INCOMPLETE]`) and the lint resolves the case, that is recorded as
 `ok (poc fail-closed)`, not a divergence -- one implementation being more
 capable is fine, one being wrong is not.
@@ -70,15 +71,17 @@ detector and an unsound bug-finder by design. `run_lockbud.py` runs it on every
 case next to the Whorl verdict. Result on this corpus:
 
 ```
-whorl false negatives: 0   | lockbud false negatives: 3 | lockbud false positives: 1
+whorl false negatives: 0   | lockbud false negatives: 6 | lockbud false positives: 1
 ```
 
 The whorl column is the real pipeline (dylint front-end into the solver), not
 the text probe, so this is tool against tool.
 
-Lockbud misses `two_account_deadlock.rs` -- the canonical textbook deadlock --
-plus `branch_deadlock.rs` and `closure_call_deadlock.rs`. Two of the three are
-the same systematic blind spot: its
+Lockbud misses six of the labeled deadlocks, including
+`two_account_deadlock.rs` -- the canonical textbook case -- plus
+`branch_deadlock.rs`, `closure_call_deadlock.rs`, and all three class-split
+cases added by the adversarial rounds. Several are the same systematic blind
+spot: its
 DoubleLock detector needs the SAME lock twice and its ConflictLock detector
 needs an inverted order between two DISTINCT named locks, so an unordered
 acquisition of two instances of the same lock class falls through both. That

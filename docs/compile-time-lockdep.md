@@ -73,12 +73,12 @@ The soundness claim is the whole value, and the literature shows soundness claim
 are routinely false in practice. So the repository ships the checks, not just the
 claim. All of these are reproducible under `experiments/`.
 
-**1. Head to head against Lockbud.** On a 14-case labeled corpus, both tools run
+**1. Head to head against Lockbud.** On an 18-case labeled corpus, both tools run
 end to end, next to Lockbud, the established static Rust deadlock detector:
 
 ```
 whorl   false negatives: 0
-lockbud false negatives: 3   (including the canonical two-account transfer deadlock)
+lockbud false negatives: 6   (including the canonical two-account transfer deadlock)
 ```
 
 Lockbud's DoubleLock detector needs the same lock twice; its ConflictLock
@@ -130,7 +130,7 @@ treating interrupt masking as a resource in the same order graph as the locks.
 
 ## Honest limits
 
-- The corpus is 14 hand-labeled cases plus Lockbud's toys. That is evidence, not
+- The corpus is 18 hand-labeled cases plus Lockbud's toys. That is evidence, not
   a proof. A general soundness claim needs scale and, ideally, a mechanized core.
 - Soundness is argued and tested, not mechanically verified. Development found
   and fixed seven real soundness bugs across the review passes; there may be more.
