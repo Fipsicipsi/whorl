@@ -215,6 +215,38 @@ far has been a SPLIT (one lock, two symbols) or a fail-closed test reading
 pre-widening state. Merging is safe; splitting is not. That is the invariant to
 attack first next time.
 
+## Resolving what used to fail closed
+
+Failing closed is correct but it is not free: three of eighteen verdicts were
+non-conclusive. Two were then resolved properly rather than merely made safe.
+
+- **Generic bodies.** Instead of refusing to render a polymorphic symbol, type
+  ARGUMENTS are now erased: `Mutex<T>` from a generic body and `Mutex<i32>` from
+  a concrete one both render `Mutex`, so they unify and the cycle closes. This
+  MERGES rather than splits, which is the safe direction, and it matches what a
+  lock class is supposed to mean -- the role a lock plays, not the payload it
+  guards. `generic_class_split_deadlock.rs` is now correctly a DEADLOCK.
+- **Trait-method accessors.** MIR keeps the TRAIT item's DefId, so a lock
+  reached through a user's `Deref` impl could not be looked up. Callees are now
+  resolved to the impl that will actually run, which makes the impl's accessor
+  summary usable. `deref_field_split_deadlock.rs` is now correctly a DEADLOCK.
+  The resolved impl must be a body we analyze; resolving to a foreign one would
+  point a call edge at code we never see, so that still fails closed.
+
+Getting the composition right took two tries, and both mistakes were splits.
+Composing an accessor suffix onto its argument has to account for whether the
+argument is already a reference (use the suffix whole) or a fresh borrow of the
+place (drop the suffix's leading deref, which that borrow already supplied).
+One deref too many or too few is a different symbol, and a different symbol is a
+lock the cycle can never reach.
+
+Known precision cost of the erasure: two locks distinguished ONLY by payload
+type merge. In `tracing-core` the callsite `Mutex` and the dispatcher `RwLock`
+are both reached through a `Lazy` deref and now share one class. Merging is
+safe, but the underlying gap is that a lock rooted in a STATIC is identified by
+its type rather than by the static itself. Static identity is the next precision
+item.
+
 ## Caveats
 
 This corpus is tiny. Eighteen labeled cases beat zero, and the head-to-head

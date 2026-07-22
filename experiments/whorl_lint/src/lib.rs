@@ -31,13 +31,11 @@ use std::fmt::Write as _;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::mir::visit::{
-    MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor,
-};
+use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{
     Body, Local, Location, Operand, Place, PlaceElem, Rvalue, StatementKind, TerminatorKind,
 };
-use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, TyCtxt};
 
 // declare_late_lint! auto-generates dylint_library!, register_lints, the
 // declare_lint! item, and the pass struct (named `WhorlLockOrder`). This is the
@@ -226,6 +224,29 @@ fn guard_class_of_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<(&'sta
     Some((kind, data))
 }
 
+/// Erase ALL balanced `<...>` groups from rendered type text.
+///
+/// Class symbols are type text, and a generic body is analyzed
+/// un-monomorphized, so the same lock renders `Mutex<T>` from `Pair<T>` and
+/// `Mutex<i32>` from a concrete caller: one lock, two symbols, and the cycle
+/// never closes. Erasing the arguments makes both render `Mutex`, which MERGES
+/// the two -- and merging is the safe direction (it can only add edges, never
+/// hide one). It also matches what a lock CLASS is supposed to mean: the role a
+/// lock plays, not the payload it happens to guard.
+fn erase_type_args(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Remove `::<...>` generic segments (balanced) from a def path, so
 /// `std::sync::Mutex::<T>::lock` compares as `std::sync::Mutex::lock`.
 /// def_path_str on this nightly renders impl-self generics INSIDE the path
@@ -343,7 +364,7 @@ fn render_projection<'tcx>(
                     _ => None,
                 };
                 let name = name.unwrap_or_else(|| format!("f{}", f.as_u32()));
-                let _ = write!(sym, ".{name}:{fty}");
+                let _ = write!(sym, ".{name}:{}", erase_type_args(&fty.to_string()));
                 let _ = write!(id, ".{name}");
                 cur_ty = *fty;
             }
@@ -362,25 +383,13 @@ fn render_projection<'tcx>(
 /// Render a whole place: its base local's TYPE plus its projection chain.
 fn render_place<'tcx>(body: &Body<'tcx>, place: Place<'tcx>) -> (String, String) {
     let base_ty = body.local_decls[place.local].ty;
-    // Symbols are rendered TYPE TEXT. A generic body is analyzed un-monomorphized,
-    // so a lock in `Pair<T>` renders with a literal `T` while the same lock seen
-    // from a concrete body renders with `i32` -- one lock, two symbols, a SPLIT.
-    // We cannot canonicalize the parameter away, so we stop claiming a
-    // conclusive verdict.
-    if base_ty.has_non_region_param()
-        || place.projection.iter().any(|e| match e {
-            PlaceElem::Field(_, fty) => fty.has_non_region_param(),
-            _ => false,
-        })
-    {
-        mark_incomplete(format!(
-            "a lock class is rendered from the polymorphic type `{base_ty}`; a              generic body and a concrete one would render the same lock              differently, so they cannot be unified"
-        ));
-    }
+    // Type arguments are erased so a generic body and a concrete one render the
+    // same lock identically (see erase_type_args).
+    let base = erase_type_args(&base_ty.to_string());
     let (sym, id) = render_projection(base_ty, place.projection);
     (
-        format!("{base_ty}{sym}"),
-        format!("{base_ty}#{}{id}", place.local.as_u32()),
+        format!("{base}{sym}"),
+        format!("{base}#{}{id}", place.local.as_u32()),
     )
 }
 
@@ -444,7 +453,7 @@ fn accessor_summary<'tcx>(body: &Body<'tcx>) -> Option<(usize, String, String)> 
 fn call_defining<'tcx>(
     body: &Body<'tcx>,
     local: Local,
-) -> Option<(DefId, Vec<Place<'tcx>>)> {
+) -> Option<(DefId, ty::GenericArgsRef<'tcx>, Vec<Place<'tcx>>)> {
     let mut found = None;
     for data in body.basic_blocks.iter() {
         if let TerminatorKind::Call { func, args, destination, .. } = &data.terminator().kind {
@@ -452,15 +461,34 @@ fn call_defining<'tcx>(
                 if found.is_some() {
                     return None;
                 }
-                let (callee, _) = func.const_fn_def()?;
+                let (callee, generics) = func.const_fn_def()?;
                 found = Some((
                     callee,
+                    generics,
                     args.iter().filter_map(|a| a.node.place()).collect::<Vec<_>>(),
                 ));
             }
         }
     }
     found
+}
+
+/// Resolve a (possibly trait-level) callee to the body that will actually run.
+/// MIR keeps the TRAIT item's DefId for trait-method calls, so a lock reached
+/// through a user's `Deref` impl, or a call edge to a trait method, is useless
+/// until it is resolved to the impl. Resolution fails inside generic code where
+/// the receiver is still a type parameter -- callers must fail closed then.
+fn resolve_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    callee: DefId,
+    generics: ty::GenericArgsRef<'tcx>,
+) -> Option<DefId> {
+    let env = ty::TypingEnv::post_analysis(tcx, owner.to_def_id());
+    match ty::Instance::try_resolve(tcx, env, callee, generics) {
+        Ok(Some(instance)) => Some(instance.def_id()),
+        _ => None,
+    }
 }
 
 /// True if `local` is defined by a Call terminator, i.e. it holds a value
@@ -690,7 +718,7 @@ fn analyze_body<'tcx>(
         // Match with `..`: Call now also has call_source/target/unwind/fn_span.
         if let TerminatorKind::Call { func, args, destination, .. } = &term.kind {
             // const_fn_def() -> Option<(DefId, GenericArgsRef)>. (verified)
-            let Some((callee, _generics)) = func.const_fn_def() else {
+            let Some((callee, _generics)): Option<(DefId, ty::GenericArgsRef<'tcx>)> = func.const_fn_def() else {
                 // A call through a value: fn pointer or trait object. We cannot
                 // see the body, so any ordering it establishes is invisible.
                 opaque_calls.push(Location { block: bb, statement_index: data.statements.len() });
@@ -784,7 +812,17 @@ fn analyze_body<'tcx>(
                     // inherent method's parent is the impl. Generic and virtual
                     // calls keep the TRAIT method here, unresolved to a body.
                     if matches!(tcx.def_kind(tcx.parent(callee)), DefKind::Trait) {
-                        opaque_calls.push(loc);
+                        // Resolve to the impl that will run; only a genuinely
+                        // unresolvable (generic or dyn) target is opaque.
+                        // The resolved impl must be a body we actually analyze.
+                        // Pointing a call edge at a foreign body would silently
+                        // drop the held-set instead of failing closed.
+                        match resolve_callee(tcx, owner, callee, _generics) {
+                            Some(concrete) if concrete != callee && concrete.is_local() => {
+                                local_calls.push((loc, tcx.def_path_str(concrete)))
+                            }
+                            _ => opaque_calls.push(loc),
+                        }
                     } else {
                         local_calls.push((loc, tcx.def_path_str(callee)));
                     }
@@ -795,7 +833,7 @@ fn analyze_body<'tcx>(
             let recv: Option<Place<'tcx>> = args.get(0).and_then(|a| a.node.place());
             // Back-track the borrow temp to its source Place, then canonicalize.
             let (class, base_id) = match recv {
-                Some(p) => lock_class_of_receiver(tcx, body, p, accessors),
+                Some(p) => lock_class_of_receiver(tcx, owner, body, p, accessors),
                 None => ("<unknown-lock>".to_string(), "<unknown>".to_string()),
             };
             let loc = Location { block: bb, statement_index: data.statements.len() };
@@ -1006,6 +1044,7 @@ fn analyze_body<'tcx>(
 /// distinguishes instances of the same class for class_instances counting.
 fn lock_class_of_receiver<'tcx>(
     tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
     body: &Body<'tcx>,
     place: Place<'tcx>,
     accessors: &HashMap<DefId, (usize, String, String)>,
@@ -1026,11 +1065,36 @@ fn lock_class_of_receiver<'tcx>(
         // Deref is what the accessor's suffix already describes.
         let extra_ok = cur.projection.is_empty()
             || (cur.projection.len() == 1 && matches!(cur.projection[0], PlaceElem::Deref));
-        if let (true, Some((callee, arg_places))) = (extra_ok, call_defining(body, cur.local)) {
+        if let (true, Some((callee, generics, arg_places))) =
+            (extra_ok, call_defining(body, cur.local))
+        {
+            // Trait-method calls keep the TRAIT DefId in MIR, so resolve to the
+            // impl that will actually run. This is what makes a user-defined
+            // `Deref` (or any trait accessor) resolvable at all.
+            let concrete = resolve_callee(tcx, owner, callee, generics).unwrap_or(callee);
+            if let Some((pix, suffix_sym, suffix_id)) = accessors.get(&concrete) {
+                if let Some(argp) = arg_places.get(pix.saturating_sub(1)) {
+                    // The suffix is relative to the accessor's PARAMETER and
+                    // begins with the deref of that reference. If the argument is
+                    // a fresh borrow (`_t = &SRC`), that borrow already supplies
+                    // the deref, so compose from SRC and drop the leading `.*`;
+                    // otherwise the argument IS the reference and the full suffix
+                    // applies. Getting this wrong renders the same lock with one
+                    // deref too many or too few, which is a split.
+                    let (base_place, sym): (Place<'tcx>, &str) =
+                        match sole_borrow_source(body, argp.local) {
+                            Some(src) if argp.projection.is_empty() => {
+                                (src, suffix_sym.strip_prefix(".*").unwrap_or(suffix_sym))
+                            }
+                            _ => (*argp, suffix_sym.as_str()),
+                        };
+                    let (base_sym, base_id) = render_place(body, base_place);
+                    return (format!("{base_sym}{sym}"), format!("{base_id}{suffix_id}"));
+                }
+            }
             // `deref(x)` is `(*x)` ONLY when the deref yields the pointee. For a
-            // user-defined Deref returning a field, rendering `.*` would invent a
-            // symbol that can never match the field path -- so that case falls
-            // through to fail-closed below.
+            // user-defined Deref returning a field this is wrong, and if the impl
+            // was not summarizable above we fall through to fail-closed.
             if is_deref_call(tcx, callee) {
                 if let Some(argp) = arg_places.first() {
                     let argp = resolve_place_root(body, *argp);
@@ -1052,7 +1116,7 @@ fn lock_class_of_receiver<'tcx>(
             }
         }
         let via = call_defining(body, cur.local)
-            .map(|(c, _)| tcx.def_path_str(c))
+            .map(|(c, _, _)| tcx.def_path_str(c))
             .unwrap_or_else(|| "<unknown call>".to_string());
         mark_incomplete(format!(
             "a lock is reached through `{via}`, whose body is not a simple field              accessor, so it has no canonical class path and may not unify with              the same lock reached directly"
