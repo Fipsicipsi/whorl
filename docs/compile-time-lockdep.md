@@ -101,7 +101,7 @@ inversion split across two thread closures.
 
 ```
 unresolved indirect call at src/callsite.rs:478 in callsite::Callsites::for_each
-while holding ["&once_cell::sync::Lazy<Mutex<Vec<&dyn Callsite>>>.*"]
+while holding ["callsite::LOCKED_CALLSITES.*"]
 ```
 
 That is a true statement about real code, not a tool defect: tracing-core invokes

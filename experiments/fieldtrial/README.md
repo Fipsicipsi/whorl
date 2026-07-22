@@ -32,7 +32,7 @@ whorl --events events.json
 
   ```
   unresolved indirect call at src/callsite.rs:478 in callsite::Callsites::for_each
-  while holding ["&once_cell::sync::Lazy<Mutex<Vec<&dyn Callsite>>>.*"]
+  while holding ["callsite::LOCKED_CALLSITES.*"]
   ```
 
   tracing-core invokes a caller-supplied callback while holding its callsite
