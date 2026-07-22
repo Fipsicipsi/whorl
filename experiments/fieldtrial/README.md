@@ -26,15 +26,24 @@ whorl --events events.json
 - **Two lock classes** were found and named from real types:
   `std::sync::Mutex<Vec<&dyn Callsite>>` (the callsite registry) and
   `std::sync::RwLock<Vec<Registrar>>` (the dispatcher registry).
-- **Verdict: originally `[SAFE]`, now `[INCOMPLETE]`.** No ordering edge is
-  found (the two locks are never held together), but a later adversarial review
-  proved the `[SAFE]` was not justified: tracing-core reaches a lock through an
-  accessor returning a reference, and the class derivation gave that route a
-  different class symbol than the field route would. Splitting one physical lock
-  into two class names is unsound -- the two nodes can never close a cycle -- so
-  an un-canonicalizable receiver now forces `[INCOMPLETE]`. The honest reading:
-  Whorl still finds no deadlock here, but it no longer claims to have proved
-  there is none.
+- **Verdict: `[INCOMPLETE]`**, with a precise reason:
+
+  ```
+  unresolved indirect call at src/callsite.rs:478 in callsite::Callsites::for_each
+  while holding ["&once_cell::sync::Lazy<Mutex<Vec<&dyn Callsite>>>.*"]
+  ```
+
+  tracing-core invokes a caller-supplied callback while holding its callsite
+  registry lock. Whatever that callback locks orders against the registry lock,
+  and Whorl cannot see it, so it declines to certify the crate. That is a true
+  statement about the code, not a tool defect.
+
+  An earlier version answered `[SAFE]` here, for the wrong reason: an adversarial
+  review proved the class derivation was SPLITTING one physical lock into two
+  symbols depending on how it was reached, and two symbols can never close a
+  cycle. That is fixed -- simple field accessors are resolved interprocedurally
+  and `Deref::deref` renders like a built-in deref, so the `once_cell::Lazy`
+  route above unifies rather than splitting. What is left is the honest residue.
 
 Only four acquisition sites turned up in a big crate because tracing-core is
 deliberately lock-light and because its own spin-mutex (`src/spin/mutex.rs`) is

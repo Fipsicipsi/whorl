@@ -25,7 +25,7 @@ extern crate rustc_span;
 // rustc_driver is declared by the declare_late_lint! expansion below.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use rustc_hir::def::DefKind;
@@ -138,6 +138,30 @@ fn mark_incomplete(reason: String) {
 impl<'tcx> LateLintPass<'tcx> for WhorlLockOrder {
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
         let tcx = cx.tcx;
+        // Pre-pass: summarize simple field accessors, so a lock reached through
+        // one renders to the SAME class as the same lock reached by field path.
+        // This must run before any body is analyzed, since callers need it.
+        let mut accessors: HashMap<DefId, (usize, String, String)> = HashMap::new();
+        for &ldid in tcx.mir_keys(()) {
+            let did = ldid.to_def_id();
+            if !matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            if !tcx.is_mir_available(did) {
+                continue;
+            }
+            if let Some(summary) = accessor_summary(tcx.optimized_mir(did)) {
+                if std::env::var("WHORL_DEBUG").is_ok() {
+                    eprintln!(
+                        "whorl-debug: field accessor {} => param #{}, path {}",
+                        tcx.def_path_str(did),
+                        summary.0,
+                        summary.1
+                    );
+                }
+                accessors.insert(did, summary);
+            }
+        }
         // mir_keys(()) -> &FxIndexSet<LocalDefId>: every DefId in this crate with
         // MIR. (verified present on TyCtxt)
         for &ldid in tcx.mir_keys(()) {
@@ -158,7 +182,7 @@ impl<'tcx> LateLintPass<'tcx> for WhorlLockOrder {
             // optimized_mir: post-borrowck, post-drop-elaboration, so RAII guard
             // unlocks are explicit Drop terminators. (verified present)
             let body: &Body<'tcx> = tcx.optimized_mir(did);
-            analyze_body(tcx, ldid, body);
+            analyze_body(tcx, ldid, body, &accessors);
         }
         write_events(tcx);
     }
@@ -271,6 +295,139 @@ fn is_callable_shaped<'tcx>(ty: ty::Ty<'tcx>) -> bool {
     )
 }
 
+/// Follow borrow temps back to the place actually being referred to. Optimized
+/// MIR freely inserts `_t = &SRC; ... (*_t)`, so both a bare temp and a deref of
+/// one must resolve to SRC; otherwise the same lock renders differently
+/// depending on how many temps the optimizer happened to introduce.
+fn resolve_place_root<'tcx>(body: &Body<'tcx>, place: Place<'tcx>) -> Place<'tcx> {
+    let mut cur = place;
+    for _ in 0..8 {
+        let idx = cur.local.as_usize();
+        if idx >= 1 && idx <= body.arg_count {
+            break; // rooted in a parameter: canonical
+        }
+        let deref_only = cur.projection.len() == 1
+            && matches!(cur.projection[0], PlaceElem::Deref);
+        if cur.projection.is_empty() || deref_only {
+            match sole_borrow_source(body, cur.local) {
+                Some(src) => {
+                    cur = src;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        break;
+    }
+    cur
+}
+
+/// Render a projection chain onto a starting type into (symbol, identity)
+/// suffixes. Field components carry their SOURCE name, so the same field
+/// reached two different ways renders identically.
+fn render_projection<'tcx>(
+    start_ty: ty::Ty<'tcx>,
+    projection: &[PlaceElem<'tcx>],
+) -> (String, String) {
+    let mut cur_ty = start_ty;
+    let (mut sym, mut id) = (String::new(), String::new());
+    for elem in projection {
+        match elem {
+            PlaceElem::Field(f, fty) => {
+                let name = match cur_ty.kind() {
+                    ty::TyKind::Adt(adt, _) if adt.is_struct() => adt
+                        .non_enum_variant()
+                        .fields
+                        .get(*f)
+                        .map(|fd| fd.name.to_string()),
+                    _ => None,
+                };
+                let name = name.unwrap_or_else(|| format!("f{}", f.as_u32()));
+                let _ = write!(sym, ".{name}:{fty}");
+                let _ = write!(id, ".{name}");
+                cur_ty = *fty;
+            }
+            PlaceElem::Deref => {
+                sym.push_str(".*");
+                if let ty::TyKind::Ref(_, inner, _) = cur_ty.kind() {
+                    cur_ty = *inner;
+                }
+            }
+            _ => sym.push_str(".[]"),
+        }
+    }
+    (sym, id)
+}
+
+/// Render a whole place: its base local's TYPE plus its projection chain.
+fn render_place<'tcx>(body: &Body<'tcx>, place: Place<'tcx>) -> (String, String) {
+    let base_ty = body.local_decls[place.local].ty;
+    let (sym, id) = render_projection(base_ty, place.projection);
+    (
+        format!("{base_ty}{sym}"),
+        format!("{base_ty}#{}{id}", place.local.as_u32()),
+    )
+}
+
+/// If this body is a simple field accessor -- it returns a reference to a
+/// projection of one of its parameters, and does so on exactly one path --
+/// summarize it as (1-based parameter index, symbol suffix, identity suffix).
+/// That lets a caller reach the SAME canonical class through the accessor as it
+/// would by touching the field directly, instead of splitting the lock in two.
+fn accessor_summary<'tcx>(body: &Body<'tcx>) -> Option<(usize, String, String)> {
+    let mut found: Option<(usize, String, String)> = None;
+    for l in move_chain(body, Local::from_u32(0)) {
+        for data in body.basic_blocks.iter() {
+            for stmt in &data.statements {
+                if let StatementKind::Assign(boxed) = &stmt.kind {
+                    let (dest, rvalue) = &**boxed;
+                    if dest.local != l || !dest.projection.is_empty() {
+                        continue;
+                    }
+                    if let Rvalue::Ref(_, _, src) = rvalue {
+                        let src = resolve_place_root(body, *src);
+                        let idx = src.local.as_usize();
+                        if idx == 0 || idx > body.arg_count {
+                            return None; // not rooted in a parameter
+                        }
+                        if found.is_some() {
+                            return None; // several return paths: not simple
+                        }
+                        let start_ty = body.local_decls[src.local].ty;
+                        let (sym, id) = render_projection(start_ty, src.projection);
+                        found = Some((idx, sym, id));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The Call terminator that defines `local`, with its callee and argument
+/// places, if there is exactly one.
+fn call_defining<'tcx>(
+    body: &Body<'tcx>,
+    local: Local,
+) -> Option<(DefId, Vec<Place<'tcx>>)> {
+    let mut found = None;
+    for data in body.basic_blocks.iter() {
+        if let TerminatorKind::Call { func, args, destination, .. } = &data.terminator().kind {
+            if destination.local == local && destination.projection.is_empty() {
+                if found.is_some() {
+                    return None;
+                }
+                let (callee, _) = func.const_fn_def()?;
+                found = Some((
+                    callee,
+                    args.iter().filter_map(|a| a.node.place()).collect::<Vec<_>>(),
+                ));
+            }
+        }
+    }
+    found
+}
+
 /// True if `local` is defined by a Call terminator, i.e. it holds a value
 /// returned by a function. The receiver resolution can only see through
 /// borrows, so a lock reached this way has no canonical field path.
@@ -316,6 +473,16 @@ fn move_chain<'tcx>(body: &Body<'tcx>, start: Local) -> Vec<Local> {
         }
     }
     chain
+}
+
+/// True if `did` is `Deref::deref` / `DerefMut::deref_mut`. Semantically the
+/// result IS `(*arg)`, so rendering it that way makes a lock reached through a
+/// smart pointer unify with the same lock reached by a built-in deref, instead
+/// of splitting it into a second class. Values of the same pointer type render
+/// alike, so this MERGES rather than splits -- the sound direction.
+fn is_deref_call<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+    let p = strip_generics(&tcx.def_path_str(did));
+    p.ends_with("Deref::deref") || p.ends_with("DerefMut::deref_mut")
 }
 
 /// True if `did` is `mem::drop`, which genuinely releases its argument.
@@ -396,7 +563,12 @@ fn callee_body_path<'tcx>(
     }
 }
 
-fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
+fn analyze_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    body: &Body<'tcx>,
+    accessors: &HashMap<DefId, (usize, String, String)>,
+) {
     let function = tcx.def_path_str(owner.to_def_id());
 
     // --- pass 1: guard locals by type -> their lock class symbol ---------------
@@ -551,7 +723,7 @@ fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, body: &Body<'tcx>) {
             let recv: Option<Place<'tcx>> = args.get(0).and_then(|a| a.node.place());
             // Back-track the borrow temp to its source Place, then canonicalize.
             let (class, base_id) = match recv {
-                Some(p) => lock_class_of_receiver(tcx, body, p),
+                Some(p) => lock_class_of_receiver(tcx, body, p, accessors),
                 None => ("<unknown-lock>".to_string(), "<unknown>".to_string()),
             };
             let loc = Location { block: bb, statement_index: data.statements.len() };
@@ -764,79 +936,50 @@ fn lock_class_of_receiver<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     place: Place<'tcx>,
+    accessors: &HashMap<DefId, (usize, String, String)>,
 ) -> (String, String) {
     // Resolve a borrow temp `_R` whose sole def is `_R = &SRC` back to SRC, so
     // `lock(move _R)` is attributed to the Mutex Place SRC. One hop is enough
     // for the common borrow-then-call pattern; loop-resolve for chains.
-    let mut cur = place;
-    for _ in 0..8 {
-        if let Some(src) = sole_borrow_source(body, cur.local) {
-            // Compose: SRC's projection followed by cur's (minus the leading
-            // autoref). For the scaffold we take SRC directly when cur has no
-            // extra projection.
-            cur = if cur.projection.is_empty() { src } else { break };
-        } else {
-            break;
-        }
-    }
-    // If the base local is the RESULT OF A CALL (an accessor handing back a
-    // reference to the lock), the projection chain we can see is not the lock's
-    // canonical path: the SAME physical lock reached through a field would get a
-    // different symbol. Splitting one lock into two class names is NOT
-    // conservative -- the two nodes can never close a cycle between them -- so
-    // the verdict stops being conclusive.
+    let cur = resolve_place_root(body, place);
+    // If the base local is the RESULT OF A CALL, the projection chain we can see
+    // is not the lock's canonical path. When the callee is a simple field
+    // accessor we can rebuild that path: substitute the argument it was called
+    // with and append the accessor's own field path, so this route renders
+    // IDENTICALLY to touching the field directly. Otherwise the lock would be
+    // split into two class symbols that can never close a cycle, which is not
+    // conservative, so the verdict stops being conclusive.
     if is_call_destination(body, cur.local) {
-        mark_incomplete(format!(
-            "a lock reached through an accessor (a call returning a reference) has              no canonical class path, so it may not unify with the same lock              reached directly"
-        ));
-    }
-    // Build a stable symbol from the base local's TYPE + the projection chain.
-    // We walk the type alongside the projections so field components can carry
-    // their SOURCE name (`.bal`) instead of a positional `.f0`.
-    let base_ty = body.local_decls[cur.local].ty;
-    let mut cur_ty = base_ty;
-    let mut sym = String::new();
-    let _ = write!(sym, "{}", base_ty);
-    let mut base_id = format!("{}#{}", base_ty, cur.local.as_u32());
-    for elem in cur.projection {
-        match elem {
-            // Field path is the heart of the class abstraction (the .0 in
-            // `(*_1).0: Mutex<T>`). Resolve the field's source name from the
-            // ADT definition; fall back to the positional index.
-            PlaceElem::Field(f, fty) => {
-                let name = match cur_ty.kind() {
-                    ty::TyKind::Adt(adt, _) if adt.is_struct() => adt
-                        .non_enum_variant()
-                        .fields
-                        .get(f)
-                        .map(|fd| fd.name.to_string()),
-                    _ => None,
-                };
-                let name = name.unwrap_or_else(|| format!("f{}", f.as_u32()));
-                let _ = write!(sym, ".{name}:{fty}");
-                let _ = write!(base_id, ".{name}");
-                cur_ty = fty;
-            }
-            PlaceElem::Deref => {
-                sym.push_str(".*");
-                // Peel the reference/box so the next Field sees the ADT.
-                if let ty::TyKind::Ref(_, inner, _) = cur_ty.kind() {
-                    cur_ty = *inner;
+        // The reference returned by the accessor is dereferenced here; that
+        // Deref is what the accessor's suffix already describes.
+        let extra_ok = cur.projection.is_empty()
+            || (cur.projection.len() == 1 && matches!(cur.projection[0], PlaceElem::Deref));
+        if let (true, Some((callee, arg_places))) = (extra_ok, call_defining(body, cur.local)) {
+            // `deref(x)` is `(*x)`: render it as the built-in deref would.
+            if is_deref_call(tcx, callee) {
+                if let Some(argp) = arg_places.first() {
+                    let (base_sym, base_id) = render_place(body, *argp);
+                    return (format!("{base_sym}.*"), format!("{base_id}.*"));
                 }
             }
-            // Index/Subslice etc.: collapse (cannot distinguish instances soundly
-            // here -> coarser class, still sound for ordering).
-            _ => {
-                sym.push_str(".[]");
+            if let Some((pix, suffix_sym, suffix_id)) = accessors.get(&callee) {
+                if let Some(argp) = arg_places.get(pix.saturating_sub(1)) {
+                    let (base_sym, base_id) = render_place(body, *argp);
+                    return (
+                        format!("{base_sym}{suffix_sym}"),
+                        format!("{base_id}{suffix_id}"),
+                    );
+                }
             }
         }
+        let via = call_defining(body, cur.local)
+            .map(|(c, _)| tcx.def_path_str(c))
+            .unwrap_or_else(|| "<unknown call>".to_string());
+        mark_incomplete(format!(
+            "a lock is reached through `{via}`, whose body is not a simple field              accessor, so it has no canonical class path and may not unify with              the same lock reached directly"
+        ));
     }
-    // VERIFY: if the base local resolves to a `static`, prefer the static DefId
-    // as identity. On this nightly a static read shows up as an Operand/Place
-    // with a Static base via PlaceElem or a preceding `_x = &STATIC`; confirm the
-    // exact representation and special-case it here (statics are a single global
-    // instance => class_instances == 1).
-    (sym, base_id)
+    render_place(body, cur)
 }
 
 /// If `local` is defined by exactly one statement of the form `local = &SRC`
